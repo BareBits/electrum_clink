@@ -1,0 +1,15 @@
+{
+  "name": "clink-sdk-payer-example",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Request a Lightning invoice from a CLINK noffer using the official @shocknet/clink-sdk.",
+  "scripts": {
+    "pay": "node pay.mjs"
+  },
+  "dependencies": {
+    "@shocknet/clink-sdk": "^1.5.5",
+    "nostr-tools": "^2.7.0",
+    "ws": "^8.18.0"
+  }
+}

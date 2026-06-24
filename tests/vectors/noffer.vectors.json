@@ -1,0 +1,54 @@
+[
+  {
+    "name": "spontaneous_noprice",
+    "input": {
+      "pubkey": "7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e",
+      "relay": "ws://127.0.0.1:7777",
+      "offer": "pay-me",
+      "priceType": 2
+    },
+    "noffer": "noffer1qvqsyqsxwpshjttdv5q3xamn8ghj7vfjxuhrqt3s9ccn5dehxumsqgr706wy92gmlmcel2ffuh76rdewp67p5nq3g9nnufu5ydxcdtwlfc8apgae",
+    "decoded": {
+      "pubkey": "7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e",
+      "relay": "ws://127.0.0.1:7777",
+      "offer": "pay-me",
+      "priceType": 2
+    }
+  },
+  {
+    "name": "fixed_price",
+    "input": {
+      "pubkey": "7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e",
+      "relay": "ws://127.0.0.1:7777",
+      "offer": "coffee",
+      "priceType": 0,
+      "price": 25000
+    },
+    "noffer": "noffer1qszqqqrp4qpszqqzqe3k7enxv4jszymhwvaz7te3xgmjuvpwxqhrzw3hxumnwqpq0elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qtxcm5u",
+    "decoded": {
+      "pubkey": "7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e",
+      "relay": "ws://127.0.0.1:7777",
+      "offer": "coffee",
+      "priceType": 0,
+      "price": 25000
+    }
+  },
+  {
+    "name": "variable_price",
+    "input": {
+      "pubkey": "7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e",
+      "relay": "ws://127.0.0.1:7777",
+      "offer": "tip",
+      "priceType": 1,
+      "price": 1
+    },
+    "noffer": "noffer1qszqqqqqqypszqgzqd6xjuqpzdmhxw309ucnydewxqhrqt338gmnwdehqqs8ul5ug253hlh3n75jne0a5xmjur4urfxpzst88cnegg6ds6ka7nsnjgvaq",
+    "decoded": {
+      "pubkey": "7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e",
+      "relay": "ws://127.0.0.1:7777",
+      "offer": "tip",
+      "priceType": 1,
+      "price": 1
+    }
+  }
+]

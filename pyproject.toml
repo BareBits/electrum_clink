@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "electrum-clink-plugin"
+version = "0.0.1"
+description = "CLINK offers plugin for Electrum: generate noffers and answer requests with Lightning invoices over Nostr."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Unlicense" }
+# Runtime deps are all provided by the host Electrum (electrum_aionostr,
+# electrum_ecc, the electrum package itself). Nothing extra is vendored.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["clink"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "e2e: end-to-end tests that boot the regtest rig (slow; require the rig checkout)",
+]
+# Unit tests run by default; opt into e2e explicitly with `-m e2e`.
+addopts = "-m 'not e2e'"

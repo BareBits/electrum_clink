@@ -1,0 +1,8 @@
+{
+  "name": "clink",
+  "fullname": "CLINK Offers",
+  "description": "Generate noffers (CLINK static payment codes) and answer requests with Lightning invoices over Nostr.",
+  "author": "CLINK Plugin Authors",
+  "available_for": ["cmdline", "qt"],
+  "version": "0.0.1"
+}
