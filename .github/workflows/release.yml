@@ -1,0 +1,51 @@
+name: Release latest
+
+# Build the Electrum external-plugin zip on every push to main and publish it
+# as a single rolling "latest" prerelease (the tag is re-pointed each run).
+on:
+  push:
+    branches: [main]
+
+# Newest push wins; cancel an in-flight release that an older commit started.
+concurrency:
+  group: release-latest
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build plugin zip
+        id: build
+        run: |
+          python scripts/build_zip.py
+          ls -l dist/
+          version=$(python -c "import json; print(json.load(open('clink/manifest.json'))['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Publish rolling "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # gh won't move an existing tag, so drop the previous rolling release
+          # and its tag, then recreate "latest" pointing at this commit.
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest dist/clink-*.zip \
+            --target "$GITHUB_SHA" \
+            --title "Latest build (v${{ steps.build.outputs.version }})" \
+            --prerelease \
+            --notes "Automated build of \`main\` at commit ${GITHUB_SHA:0:7} (plugin version ${{ steps.build.outputs.version }}).
+
+          Install in Electrum via **Tools -> Plugins -> Add** using the attached zip.
+
+          > Rolling build: this release is overwritten on every push to \`main\`."
