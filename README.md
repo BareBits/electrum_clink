@@ -4,7 +4,7 @@ This is experimental software and is released "as-is" without any warranty or gu
 
 # 🥂 Electrum CLINK Plugin
 
-This plugin implements the noffer functionality of the 🥂[CLINK protocol](https://clinkme.dev/). This leverages nostr to solve the "I have a lightning wallet but no LNURL or open port to accept payments" option.
+This plugin implements the noffer functionality of the 🥂[CLINK protocol](https://clinkme.dev/). This leverages nostr to solve the "I have a lightning wallet but no LNURL or open port to accept payments" problem.
 
 Like an LNURL, an noffer string can be provided to any external wallet to make a payment to your Electrum wallet (provided there is sufficient inbound liquidity). It does not rely on having any ports open, but your wallet must be online to receive the payment (same as any other lightning payment).
 
