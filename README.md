@@ -16,6 +16,11 @@ no HTTP callbacks, no SSL/domain requirements. See the
 * **Answer requests.** It subscribes to its relay for kind-`21001` requests,
   NIP-44-decrypts them, and replies with a BOLT-11 invoice — or a structured
   error (NIP-69 codes) when it can't fulfil the request.
+* **Offer labels + payer memos.** Each offer carries an editable label, and the
+  invoice memo combines that label with the payer's optional NIP-69
+  `description` as `"<label> - <description>"`. Folding in the payer memo is a
+  per-offer toggle (`allow_payer_memo`, on by default); disable it and invoices
+  always carry just the label. Both are editable in the CLINK tab and via CLI.
 * **Payment receipts.** When an issued invoice is actually paid, the plugin sends
   the payer a follow-up kind-`21001` event whose decrypted body is `{"res":"ok"}`
   — the receipt the reference `@shocknet/clink-sdk` surfaces via its `onReceipt`
@@ -78,8 +83,11 @@ also shows a one-time first-run notice.
 When enabled, the plugin registers `clink_`-prefixed commands:
 
 ```bash
-electrum clink_add_offer --label "coffee"   # -> {offer_id, label, noffer}
+electrum clink_add_offer --label "coffee"   # -> {offer_id, label, allow_payer_memo, noffer}
+electrum clink_add_offer --label "coffee" --allow_payer_memo false  # never fold in payer memos
 electrum clink_list_offers
+electrum clink_set_offer_label <offer_id> --label "tea"   # rename an offer
+electrum clink_set_offer_payer_memo <offer_id> false      # allow/disallow payer memos
 electrum clink_remove_offer <offer_id>
 electrum clink_clink_status                 # available / reserved liquidity
 electrum clink_devfee_status                # dev-fee settings + owed balance

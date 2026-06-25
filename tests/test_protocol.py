@@ -11,6 +11,7 @@ from clink.protocol import (
     MEMO_MAX_LEN,
     IssueInvoice,
     SendError,
+    effective_description,
     invoice_message,
     receipt_payload,
     request_description,
@@ -133,3 +134,24 @@ def test_invoice_message_fallback_when_empty() -> None:
 def test_invoice_message_capped_at_memo_max() -> None:
     msg = invoice_message("L" * 80, "D" * 80)
     assert len(msg) <= MEMO_MAX_LEN
+
+
+# ---- per-offer payer-memo gate ----
+
+def test_effective_description_honored_when_allowed() -> None:
+    offer = _offer(allow_payer_memo=True)
+    assert effective_description(offer, {"description": "  hi there  "}) == "hi there"
+
+
+def test_effective_description_suppressed_when_disallowed() -> None:
+    offer = _offer(allow_payer_memo=False)
+    assert effective_description(offer, {"description": "hi there"}) is None
+
+
+def test_effective_description_none_when_offer_missing() -> None:
+    assert effective_description(None, {"description": "hi there"}) is None
+
+
+def test_effective_description_none_when_no_payer_memo() -> None:
+    offer = _offer(allow_payer_memo=True)
+    assert effective_description(offer, {}) is None

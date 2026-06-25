@@ -86,8 +86,28 @@ def rig() -> Dict[str, Any]:
                 pass
 
 
+def _invoice_memo(bolt11: str) -> str:
+    """Decode a regtest BOLT-11 invoice's memo.
+
+    ``decode_bolt11_invoice`` defaults to ``constants.net`` (mainnet in a bare
+    pytest process), which would mis-parse the ``lnbcrt`` HRP — so pin the net to
+    regtest explicitly.
+    """
+    from electrum import constants
+    from electrum.bolt11 import decode_bolt11_invoice
+    return decode_bolt11_invoice(bolt11, net=constants.BitcoinRegtest).get_description()
+
+
 def _fresh_noffer() -> str:
     created = json.loads(_electrum_cli("clink_add_offer", "--label", "e2e"))
+    return created["noffer"]
+
+
+def _fresh_noffer_memo_disallowed() -> str:
+    created = json.loads(_electrum_cli("clink_add_offer", "--label", "e2e"))
+    _electrum_cli("clink_set_offer_payer_memo", created["offer_id"], "false")
+    offers = json.loads(_electrum_cli("clink_list_offers"))
+    assert offers[created["offer_id"]]["allow_payer_memo"] is False
     return created["noffer"]
 
 
@@ -134,16 +154,25 @@ def test_issued_invoice_carries_requested_description(rig) -> None:
     payer note of ``Acme Coffee - 2x Latte`` must surface as that combined memo
     on the minted regtest invoice (this is what cashupayserver relies on to put
     the store name in the customer's invoice)."""
-    from electrum.bolt11 import decode_bolt11_invoice
-
     noffer = _fresh_noffer()
     available = _available_sat()
     amount = max(1, min(1000, available // 2))
     resp = asyncio.run(request_invoice(
         noffer, amount_sats=amount, description="Acme Coffee - 2x Latte", timeout=30))
     assert "bolt11" in resp, resp
-    memo = decode_bolt11_invoice(resp["bolt11"]).get_description()
-    assert memo == "e2e - Acme Coffee - 2x Latte", memo
+    assert _invoice_memo(resp["bolt11"]) == "e2e - Acme Coffee - 2x Latte"
+
+
+def test_disallowed_payer_memo_is_ignored(rig) -> None:
+    """An offer with payer memos disallowed ignores the request ``description``;
+    the issued invoice carries only the merchant's label."""
+    noffer = _fresh_noffer_memo_disallowed()
+    available = _available_sat()
+    amount = max(1, min(1000, available // 2))
+    resp = asyncio.run(request_invoice(
+        noffer, amount_sats=amount, description="Acme Coffee - 2x Latte", timeout=30))
+    assert "bolt11" in resp, resp
+    assert _invoice_memo(resp["bolt11"]) == "e2e"
 
 
 def test_payment_receipt_delivered_after_payment(rig) -> None:
