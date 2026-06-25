@@ -8,7 +8,7 @@ This plugin implements the noffer functionality of the 🥂[CLINK protocol](http
 
 Like an LNURL, an noffer string can be provided to any external wallet to make a payment to your Electrum wallet (provided there is sufficient inbound liquidity). It does not rely on having any ports open, but your wallet must be online to receive the payment (same as any other lightning payment).
 
-⚡ As long as your nost relay of choice is online, you can receive lightning payments via CLINK!
+⚡ As long as your nostr relay of choice is online, you can receive lightning payments via CLINK!
 
 This software is developed by BareBits. Need simple Bitcoin payments for your point-of-sale store or e-commerce website? We have easy, affordable self-custody solutions and even handle the setup for you. Learn more at [getbarebits.com](https://getbarebits.com)
 
