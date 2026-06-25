@@ -137,4 +137,4 @@ simpler — always authorized, hot-reload, no patch.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Unlicense (public domain) — see [LICENSE](LICENSE).
