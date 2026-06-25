@@ -42,6 +42,16 @@ def success_payload(bolt11: str) -> Dict[str, Any]:
     return {"bolt11": bolt11}
 
 
+def receipt_payload() -> Dict[str, Any]:
+    """The post-payment receipt body the payer's ``onReceipt`` callback expects.
+
+    Sent as a *second* kind-21001 event (after the invoice) once the invoice we
+    issued for an offer is actually paid. Kept byte-compatible with the reference
+    ``@shocknet/clink-sdk`` ``NofferReceipt`` type, which is exactly ``{res: 'ok'}``.
+    """
+    return {"res": "ok"}
+
+
 def request_amount_sat(req: Dict[str, Any]) -> Optional[int]:
     """Extract the payer's requested amount, tolerating both field spellings.
 

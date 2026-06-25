@@ -10,6 +10,7 @@ from clink.protocol import (
     ERR_UNSUPPORTED_FEATURE,
     IssueInvoice,
     SendError,
+    receipt_payload,
     resolve_request,
 )
 
@@ -80,3 +81,8 @@ def test_fixed_offer_unsupported_in_v1() -> None:
 def test_exact_available_is_allowed() -> None:
     res = resolve_request({"amount_sats": 100_000}, _offer(), available_sat=100_000)
     assert isinstance(res, IssueInvoice)
+
+
+def test_receipt_payload_is_sdk_shape() -> None:
+    # The reference @shocknet/clink-sdk NofferReceipt type is exactly {res: 'ok'}.
+    assert receipt_payload() == {"res": "ok"}

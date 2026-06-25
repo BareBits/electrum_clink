@@ -48,6 +48,7 @@ from .devfee import MIN_PAYOUT_SAT, DevFeeLedger
 from .liquidity import LiquidityReserver, receivable_capacity_sat
 from .noffer import Noffer, OfferPriceType, noffer_encode
 from .offers import OfferStore
+from .receipts import RETRY_INTERVAL_SEC, ReceiptRegistry, ReceiptTarget
 
 if TYPE_CHECKING:
     from electrum.simple_config import SimpleConfig
@@ -94,6 +95,9 @@ class ClinkServer(Logger, EventListener):
             enabled_fn=lambda: bool(self.config.CLINK_DEVFEE_ENABLED),  # type: ignore[attr-defined]
             rate_fn=lambda: float(self.config.CLINK_DEVFEE_RATE_PERCENT),  # type: ignore[attr-defined]
         )
+        # Receipts owed to payers once their invoices settle. Persisted so a
+        # receipt survives relay drops / restarts between payment and delivery.
+        self.receipts = ReceiptRegistry(storage, clock_fn=time.time)
         # Serialise payout attempts so a post-payment trigger can't race the
         # startup check into two concurrent sends.
         self._devfee_lock = asyncio.Lock()
@@ -162,6 +166,7 @@ class ClinkServer(Logger, EventListener):
                     self.taskgroup = tg
                     await tg.spawn(self.handle_requests())
                     await tg.spawn(self._devfee_startup_check())
+                    await tg.spawn(self._redeliver_receipts())
             except asyncio.CancelledError:
                 if self.do_stop:
                     return
@@ -284,25 +289,81 @@ class ClinkServer(Logger, EventListener):
 
         # Remember this hash so the dev fee accrues if (and only if) it is paid.
         self.devfee.mark_issued(request.rhash)
+        # Remember who to send the payment receipt to once this invoice settles.
+        self.receipts.remember(request.rhash, event.pubkey, event.id,
+                               expires_at=time.time() + expiry)
 
         self.logger.info(f"issued {amount_sat} sat invoice for offer {req_offer_id(offer)} "
                          f"(rhash={request.rhash[:10]}…), liquidity locked for {expiry}s")
         self._record(req_offer_id(offer), amount_sat, "invoice issued")
         await self.send_response(event, protocol.success_payload(bolt11))
 
+    def _encrypt_event_args(self, to_pubkey: str, request_event_id: str,
+                            payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Build the kind-21001 event kwargs addressed to ``to_pubkey``.
+
+        The ``["e", request_event_id]`` tag is what lets the payer's open
+        subscription (filtered on ``#p`` + ``#e``) match both the invoice and the
+        later receipt for the same request.
+        """
+        content = nip44.encrypt_to(self.private_key.raw_secret, to_pubkey, json.dumps(payload))
+        tags = [["p", to_pubkey], ["e", request_event_id], ["clink_version", CLINK_VERSION]]
+        return dict(kind=CLINK_EVENT_KIND, tags=tags, content=content,
+                    private_key=self.private_key.hex())
+
     async def send_response(self, request_event: nEvent, payload: Dict[str, Any]) -> None:
-        content = nip44.encrypt_to(self.private_key.raw_secret, request_event.pubkey, json.dumps(payload))
-        tags = [["p", request_event.pubkey], ["e", request_event.id], ["clink_version", CLINK_VERSION]]
         tg = self.taskgroup
         if tg is None:
             return
         await tg.spawn(aionostr._add_event(
             self.manager,
-            kind=CLINK_EVENT_KIND,
-            tags=tags,
-            content=content,
-            private_key=self.private_key.hex(),
+            **self._encrypt_event_args(request_event.pubkey, request_event.id, payload),
         ))
+
+    # --- payment receipts ------------------------------------------------
+
+    async def _deliver_receipt(self, target: ReceiptTarget) -> bool:
+        """Publish the ``{"res":"ok"}`` receipt for a settled invoice.
+
+        Best-effort and idempotent: stamps the attempt first (so a failure waits
+        a full retry interval), awaits the relay publish, and only on success
+        removes the owed entry. Never raises — a failure leaves the receipt owed
+        for the periodic retry loop.
+        """
+        self.receipts.record_attempt(target.rhash)
+        if self.manager is None:
+            return False
+        try:
+            await asyncio.wait_for(aionostr._add_event(
+                self.manager,
+                **self._encrypt_event_args(
+                    target.payer_pubkey, target.request_event_id, protocol.receipt_payload()),
+            ), timeout=30)
+        except Exception as e:
+            self.logger.warning(
+                f"receipt delivery failed for {target.rhash[:10]}… "
+                f"(attempt {target.attempts + 1}); will retry: {e!r}")
+            return False
+        self.receipts.mark_sent(target.rhash)
+        self.logger.info(f"receipt delivered to {target.payer_pubkey[:10]}… "
+                         f"for {target.rhash[:10]}…")
+        self._record("receipt", None, "receipt sent ✓")
+        return True
+
+    async def _redeliver_receipts(self) -> None:
+        """Retry any owed receipts now and hourly thereafter.
+
+        Runs inside the relay taskgroup, so it also fires once on every
+        reconnect/restart — covering receipts owed while we were offline.
+        """
+        while True:
+            try:
+                self.receipts.sweep()
+                for target in self.receipts.due_targets():
+                    await self._deliver_receipt(target)
+            except Exception:
+                self.logger.exception("error redelivering receipts")
+            await asyncio.sleep(RETRY_INTERVAL_SEC)
 
     @event_listener
     def on_event_request_status(self, wallet, key, status):
@@ -314,6 +375,13 @@ class ClinkServer(Logger, EventListener):
         if not (request and request.is_lightning()):
             return
         self.reserver.release(request.rhash)
+        # A receipt is now owed to the payer of this CLINK invoice; persist that
+        # (mark_due) and fire a best-effort delivery on the asyncio loop. The
+        # entry stays owed until the relay accepts it, so a drop here is retried.
+        target = self.receipts.mark_due(request.rhash)
+        if target is not None:
+            asyncio.run_coroutine_threadsafe(
+                self._deliver_receipt(target), get_asyncio_loop())
         # Accrue the dev fee on payments to invoices we issued for a CLINK offer.
         if self.devfee.take_issued(request.rhash):
             amount_sat = request.get_amount_sat()
@@ -486,11 +554,13 @@ class ClinkPlugin(BasePlugin):
 
     def liquidity_status(self) -> Dict[str, Any]:
         if self.server is None:
-            return {"available_sat": 0, "reserved_sat": 0, "active_reservations": 0}
+            return {"available_sat": 0, "reserved_sat": 0, "active_reservations": 0,
+                    "owed_receipts": 0}
         return {
             "available_sat": self.server.reserver.available_sat(),
             "reserved_sat": self.server.reserver.reserved_sat(),
             "active_reservations": len(self.server.reserver.active()),
+            "owed_receipts": self.server.receipts.owed_count(),
         }
 
     def recent_activity(self) -> list:
