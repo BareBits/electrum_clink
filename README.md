@@ -20,7 +20,7 @@ This software is developed by BareBits. Need simple Bitcoin payments for your po
 
 ## ♥️ Dev Fee
 
-An *optional* .1% dev fee is included by default, which can be disabled in the settings. This dev fee helps fund development and is counted against any funds you receive 
+An *optional* .1% dev fee is included by default, which can be disabled in the settings. This dev fee helps fund development and is counted against any funds you receive via CLINK noffers.
 
 ## What it does (v1)
 
