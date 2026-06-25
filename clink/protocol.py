@@ -52,6 +52,48 @@ def receipt_payload() -> Dict[str, Any]:
     return {"res": "ok"}
 
 
+# Cap for the human-readable invoice memo. The CLINK request ``description`` is
+# spec-capped at 100 chars (the reference @shocknet/clink-sdk rejects longer);
+# we keep the *combined* memo within the same budget so the bolt11 stays tidy.
+MEMO_MAX_LEN = 100
+
+
+def request_description(req: Dict[str, Any]) -> Optional[str]:
+    """Extract the payer's optional note from a request, sanitized.
+
+    NIP-69 / the reference SDK carry an optional ``description`` (max 100 chars).
+    We collapse control characters and runs of whitespace to single spaces so
+    the bolt11 memo stays a clean single line, then cap the length. Returns
+    ``None`` when the field is absent, not a string, or empty after cleaning.
+    """
+    raw = req.get("description")
+    if not isinstance(raw, str):
+        return None
+    # Replace anything non-printable (newlines, control chars) with a space,
+    # then collapse whitespace runs.
+    cleaned = " ".join(
+        "".join(ch if ch.isprintable() else " " for ch in raw).split()
+    )
+    if not cleaned:
+        return None
+    return cleaned[:MEMO_MAX_LEN].rstrip()
+
+
+def invoice_message(offer_label: Optional[str], description: Optional[str]) -> str:
+    """Build the bolt11 memo for an issued invoice.
+
+    Combines the merchant's offer label with the payer's requested description
+    as ``"<label> - <description>"``, dropping whichever is missing and capping
+    the result at :data:`MEMO_MAX_LEN`. Falls back to a generic label when
+    neither is present, preserving the prior behaviour for label-less offers.
+    """
+    parts = [p.strip() for p in (offer_label, description) if p and p.strip()]
+    message = " - ".join(parts)
+    if len(message) > MEMO_MAX_LEN:
+        message = message[:MEMO_MAX_LEN].rstrip()
+    return message or "CLINK offer"
+
+
 def request_amount_sat(req: Dict[str, Any]) -> Optional[int]:
     """Extract the payer's requested amount, tolerating both field spellings.
 

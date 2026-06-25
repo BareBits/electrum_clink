@@ -252,7 +252,10 @@ class ClinkServer(Logger, EventListener):
             await self.send_response(event, resolution.payload)
             return
 
-        await self._issue_invoice(event, offer, resolution.amount_sat)
+        await self._issue_invoice(
+            event, offer, resolution.amount_sat,
+            protocol.request_description(req),
+        )
 
     def _record(self, offer_id: str, amount: Optional[int], result: str) -> None:
         self.recent_activity.append({
@@ -260,9 +263,13 @@ class ClinkServer(Logger, EventListener):
             "amount_sat": amount, "result": result,
         })
 
-    async def _issue_invoice(self, event: nEvent, offer, amount_sat: int) -> None:
+    async def _issue_invoice(self, event: nEvent, offer, amount_sat: int,
+                             description: Optional[str] = None) -> None:
         expiry = self.invoice_expiry_sec
-        message = (offer.label or "CLINK offer") if offer else "CLINK offer"
+        # Honor the payer's requested memo (NIP-69 description), combined with
+        # the merchant's offer label, so the invoice carries who-it's-for context
+        # (e.g. cashupayserver sends the store name). Capped/sanitized upstream.
+        message = protocol.invoice_message(offer.label if offer else None, description)
         try:
             key = self.wallet.create_request(
                 amount_sat=amount_sat, message=message, exp_delay=expiry, address=None)

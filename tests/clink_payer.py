@@ -27,12 +27,14 @@ async def request_invoice(
     noffer_str: str,
     amount_sats: Optional[int],
     *,
+    description: Optional[str] = None,
     timeout: float = 25.0,
 ) -> Dict[str, Any]:
     """Send an offer request for ``noffer_str`` and return the decrypted reply.
 
     Returns the response payload dict: ``{"bolt11": ...}`` on success or
-    ``{"code", "error", ...}`` on a protocol error.
+    ``{"code", "error", ...}`` on a protocol error. ``description`` carries the
+    optional NIP-69 payer note the service may fold into the invoice memo.
     """
     offer = noffer_decode(noffer_str)
     sk = PrivateKey()
@@ -41,6 +43,8 @@ async def request_invoice(
     payload: Dict[str, Any] = {"offer": offer.offer}
     if amount_sats is not None:
         payload["amount_sats"] = amount_sats
+    if description is not None:
+        payload["description"] = description
     content = nip44.encrypt_to(sk.raw_secret, offer.pubkey, json.dumps(payload))
 
     manager = aionostr.Manager(relays=[offer.relay], private_key=sk.hex())

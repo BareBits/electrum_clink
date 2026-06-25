@@ -126,6 +126,26 @@ def test_happy_path_returns_payable_invoice(rig) -> None:
     assert resp["bolt11"].lower().startswith("lnbcrt")
 
 
+def test_issued_invoice_carries_requested_description(rig) -> None:
+    """The plugin folds the payer's NIP-69 ``description`` into the bolt11 memo,
+    combined with the offer label as ``"<label> - <description>"``.
+
+    The offer here is created with label ``e2e`` (see ``_fresh_noffer``), so a
+    payer note of ``Acme Coffee - 2x Latte`` must surface as that combined memo
+    on the minted regtest invoice (this is what cashupayserver relies on to put
+    the store name in the customer's invoice)."""
+    from electrum.bolt11 import decode_bolt11_invoice
+
+    noffer = _fresh_noffer()
+    available = _available_sat()
+    amount = max(1, min(1000, available // 2))
+    resp = asyncio.run(request_invoice(
+        noffer, amount_sats=amount, description="Acme Coffee - 2x Latte", timeout=30))
+    assert "bolt11" in resp, resp
+    memo = decode_bolt11_invoice(resp["bolt11"]).get_description()
+    assert memo == "e2e - Acme Coffee - 2x Latte", memo
+
+
 def test_payment_receipt_delivered_after_payment(rig) -> None:
     # Full round trip: request -> invoice -> pay it from LND -> the plugin should
     # send the payer a kind-21001 {"res":"ok"} receipt on the same subscription.

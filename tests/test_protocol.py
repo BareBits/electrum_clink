@@ -8,9 +8,12 @@ from clink.protocol import (
     ERR_INVALID_AMOUNT,
     ERR_INVALID_OFFER,
     ERR_UNSUPPORTED_FEATURE,
+    MEMO_MAX_LEN,
     IssueInvoice,
     SendError,
+    invoice_message,
     receipt_payload,
+    request_description,
     resolve_request,
 )
 
@@ -86,3 +89,47 @@ def test_exact_available_is_allowed() -> None:
 def test_receipt_payload_is_sdk_shape() -> None:
     # The reference @shocknet/clink-sdk NofferReceipt type is exactly {res: 'ok'}.
     assert receipt_payload() == {"res": "ok"}
+
+
+# ---- payer description extraction / invoice memo composition ----
+
+def test_request_description_extracted_and_trimmed() -> None:
+    assert request_description({"description": "  Acme Coffee  "}) == "Acme Coffee"
+
+
+def test_request_description_absent_or_non_string() -> None:
+    assert request_description({}) is None
+    assert request_description({"description": ""}) is None
+    assert request_description({"description": "   "}) is None
+    assert request_description({"description": 123}) is None
+    assert request_description({"description": None}) is None
+
+
+def test_request_description_sanitizes_control_chars_to_single_line() -> None:
+    assert request_description({"description": "Acme\nCoffee\t- 2x  Latte"}) == "Acme Coffee - 2x Latte"
+
+
+def test_request_description_capped_at_memo_max() -> None:
+    out = request_description({"description": "z" * 250})
+    assert out == "z" * MEMO_MAX_LEN
+    assert len(out) == MEMO_MAX_LEN
+
+
+def test_invoice_message_combines_label_and_description() -> None:
+    assert invoice_message("shop", "Acme Coffee - 2x Latte") == "shop - Acme Coffee - 2x Latte"
+
+
+def test_invoice_message_drops_missing_pieces() -> None:
+    assert invoice_message("shop", None) == "shop"
+    assert invoice_message("", "Acme Coffee") == "Acme Coffee"
+    assert invoice_message(None, "Acme Coffee") == "Acme Coffee"
+
+
+def test_invoice_message_fallback_when_empty() -> None:
+    assert invoice_message(None, None) == "CLINK offer"
+    assert invoice_message("", "") == "CLINK offer"
+
+
+def test_invoice_message_capped_at_memo_max() -> None:
+    msg = invoice_message("L" * 80, "D" * 80)
+    assert len(msg) <= MEMO_MAX_LEN
