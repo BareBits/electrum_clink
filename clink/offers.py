@@ -32,6 +32,10 @@ class Offer:
     price: Optional[int] = None  # sats; reserved for FIXED/VARIABLE
     active: bool = True
     created_at: int = 0
+    # Whether a payer's requested memo (NIP-69 ``description``) is folded into the
+    # issued invoice. Defaults to ``True`` so pre-existing offers keep honoring
+    # memos (the behaviour before this flag existed).
+    allow_payer_memo: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -47,6 +51,7 @@ class Offer:
             price=d.get("price"),
             active=d.get("active", True),
             created_at=d.get("created_at", 0),
+            allow_payer_memo=d.get("allow_payer_memo", True),
         )
 
 
@@ -68,13 +73,15 @@ class OfferStore:
 
     def create(self, label: str = "",
                price_type: OfferPriceType = OfferPriceType.SPONTANEOUS,
-               price: Optional[int] = None) -> Offer:
+               price: Optional[int] = None,
+               allow_payer_memo: bool = True) -> Offer:
         offer = Offer(
             offer_id=_new_offer_id(),
             label=label,
             price_type=price_type,
             price=price,
             created_at=int(self._now_fn()),
+            allow_payer_memo=allow_payer_memo,
         )
         self._offers[offer.offer_id] = offer
         self._persist()
@@ -98,5 +105,21 @@ class OfferStore:
         if offer is None:
             return False
         offer.active = active
+        self._persist()
+        return True
+
+    def set_label(self, offer_id: str, label: str) -> bool:
+        offer = self._offers.get(offer_id)
+        if offer is None:
+            return False
+        offer.label = label
+        self._persist()
+        return True
+
+    def set_allow_payer_memo(self, offer_id: str, allow: bool) -> bool:
+        offer = self._offers.get(offer_id)
+        if offer is None:
+            return False
+        offer.allow_payer_memo = bool(allow)
         self._persist()
         return True

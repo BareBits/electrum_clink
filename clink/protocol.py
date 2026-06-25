@@ -79,6 +79,18 @@ def request_description(req: Dict[str, Any]) -> Optional[str]:
     return cleaned[:MEMO_MAX_LEN].rstrip()
 
 
+def effective_description(offer: Optional[Offer], req: Dict[str, Any]) -> Optional[str]:
+    """The payer memo to fold into the invoice, honoring the offer's gate.
+
+    Returns the sanitized payer ``description`` only when the offer exists and
+    permits payer-selected memos (``allow_payer_memo``); otherwise ``None``, so
+    the invoice falls back to just the merchant's label.
+    """
+    if offer is None or not getattr(offer, "allow_payer_memo", True):
+        return None
+    return request_description(req)
+
+
 def invoice_message(offer_label: Optional[str], description: Optional[str]) -> str:
     """Build the bolt11 memo for an issued invoice.
 

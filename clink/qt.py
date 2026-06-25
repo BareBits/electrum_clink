@@ -14,14 +14,17 @@ from typing import TYPE_CHECKING, Optional
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QMessageBox, QPushButton, QSlider, QSpinBox, QTextEdit,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QFrame, QGroupBox, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
+    QSlider, QSpinBox, QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from electrum.i18n import _
 from electrum.plugin import hook
-from electrum.gui.qt.util import Buttons, CloseButton, WindowModalDialog, read_QIcon
+from electrum.gui.qt.util import (
+    Buttons, CancelButton, CloseButton, OkButton, WindowModalDialog, read_QIcon,
+)
 from electrum.gui.common_qt.util import paintQR
 
 from .clink_plugin import ClinkPlugin
@@ -59,6 +62,21 @@ def _devfee_slider_to_pct(value: int) -> float:
 
 def _fmt_pct(pct: float) -> str:
     return f"{pct:.4g}%"
+
+
+# Offers table columns.
+COL_LABEL = 0
+COL_MEMO = 1
+COL_OFFER = 2
+COL_NOFFER = 3
+
+# offer_id is stashed on the row (column 0) so label edits never lose the key.
+OFFER_ID_ROLE = Qt.ItemDataRole.UserRole
+
+# When the CLINK tab is first shown, grow the window *up to* this size so the
+# offers table is visible out of the box — never shrinking a larger window.
+GROW_TARGET_W = 1000
+GROW_TARGET_H = 760
 
 if TYPE_CHECKING:
     from electrum.wallet import Abstract_Wallet
@@ -98,8 +116,23 @@ class ClinkTab(QWidget):
         QWidget.__init__(self)
         self.plugin = plugin
         self.window = window
+        # Guards itemChanged while we repopulate the table, and one-shot window grow.
+        self._populating = False
+        self._grown = False
 
-        root = QVBoxLayout(self)
+        # The whole tab scrolls, so a short Electrum window never hides the
+        # offers table or the controls below it (the auto-grow below handles the
+        # common case; this is the safety net for small screens / maximized).
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        root = QVBoxLayout(content)
 
         header = QLabel("<b>" + _("CLINK Offers") + "</b> — "
                         + _("generate noffers and answer requests with Lightning invoices"))
@@ -123,13 +156,20 @@ class ClinkTab(QWidget):
         root.addLayout(status_row)
 
         # --- offers table ------------------------------------------------
-        root.addWidget(QLabel(_("Offers:")))
+        root.addWidget(QLabel(_("Offers (double-click a label to rename):")))
         self.offers_list = QTreeWidget()
-        self.offers_list.setHeaderLabels([_("Label"), _("Offer id"), _("noffer")])
+        self.offers_list.setHeaderLabels(
+            [_("Label"), _("Payer memo"), _("Offer id"), _("noffer")])
         self.offers_list.setRootIsDecorated(False)
         self.offers_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.offers_list.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        # We drive editing ourselves (only the label column, on double-click), so
+        # the default triggers stay off — otherwise other columns could be edited.
+        self.offers_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.offers_list.header().setSectionResizeMode(COL_NOFFER, QHeaderView.ResizeMode.Stretch)
+        self.offers_list.header().setSectionResizeMode(COL_MEMO, QHeaderView.ResizeMode.ResizeToContents)
         self.offers_list.itemSelectionChanged.connect(self._update_buttons)
+        self.offers_list.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.offers_list.itemChanged.connect(self._on_item_changed)
         root.addWidget(self.offers_list, stretch=2)
 
         new_btn = QPushButton(_("New offer"))
@@ -165,7 +205,30 @@ class ClinkTab(QWidget):
         self._timer.timeout.connect(self._refresh_dynamic)
         self._timer.start(2000)
 
+        # Grow the window the first time this tab is shown (see _maybe_grow_window).
+        self.window.tabs.currentChanged.connect(self._on_tab_changed)
+
         self._maybe_show_devfee_notice()
+
+    # -- window sizing ----------------------------------------------------
+    def _on_tab_changed(self, index: int) -> None:
+        if self.window.tabs.widget(index) is self:
+            self._maybe_grow_window()
+
+    def _maybe_grow_window(self) -> None:
+        """One-shot: enlarge the window toward GROW_TARGET so the offers table is
+        visible. Only ever grows, skips a maximized/fullscreen window, and never
+        fights a later manual resize (it runs at most once per tab instance)."""
+        if self._grown:
+            return
+        self._grown = True
+        win = self.window
+        if win.isMaximized() or win.isFullScreen():
+            return
+        new_w = max(win.width(), GROW_TARGET_W)
+        new_h = max(win.height(), GROW_TARGET_H)
+        if new_w != win.width() or new_h != win.height():
+            win.resize(new_w, new_h)
 
     # -- dev fee ----------------------------------------------------------
     def _build_devfee_group(self) -> QGroupBox:
@@ -184,14 +247,16 @@ class ClinkTab(QWidget):
 
         rate_row = QHBoxLayout()
         rate_row.addWidget(QLabel(_("Rate:")))
+        # Show the current percent at the start of the slider (next to "Rate:"),
+        # before the slider itself.
+        self.devfee_rate_label = QLabel()
+        self.devfee_rate_label.setMinimumWidth(70)
+        rate_row.addWidget(self.devfee_rate_label)
         self.devfee_slider = QSlider(Qt.Orientation.Horizontal)
         self.devfee_slider.setRange(0, _DEVFEE_SLIDER_STEPS)
         self.devfee_slider.setValue(_devfee_pct_to_slider(float(cfg.CLINK_DEVFEE_RATE_PERCENT)))
         self.devfee_slider.valueChanged.connect(self._on_devfee_rate_changed)
         rate_row.addWidget(self.devfee_slider, stretch=1)
-        self.devfee_rate_label = QLabel()
-        self.devfee_rate_label.setMinimumWidth(70)
-        rate_row.addWidget(self.devfee_rate_label)
         v.addLayout(rate_row)
 
         self.devfee_owed_label = QLabel()
@@ -227,7 +292,11 @@ class ClinkTab(QWidget):
     # -- helpers ----------------------------------------------------------
     def _selected_noffer(self) -> Optional[str]:
         items = self.offers_list.selectedItems()
-        return items[0].text(2) if items else None
+        return items[0].text(COL_NOFFER) if items else None
+
+    def _selected_offer_id(self) -> Optional[str]:
+        items = self.offers_list.selectedItems()
+        return items[0].data(COL_LABEL, OFFER_ID_ROLE) if items else None
 
     def _update_buttons(self) -> None:
         has_sel = bool(self.offers_list.selectedItems())
@@ -238,15 +307,57 @@ class ClinkTab(QWidget):
         self.plugin.config.CLINK_INVOICE_EXPIRY = int(value)
 
     def _on_new_offer(self) -> None:
-        self.plugin.create_offer(label="")
+        result = self._prompt_offer_details()
+        if result is None:
+            return
+        label, allow_memo = result
+        self.plugin.create_offer(label=label, allow_payer_memo=allow_memo)
         self._refresh()
 
+    def _prompt_offer_details(self) -> Optional[tuple[str, bool]]:
+        """Ask for a new offer's label and memo policy. Returns ``None`` if cancelled."""
+        d = WindowModalDialog(self.window, _("New CLINK offer"))
+        vbox = QVBoxLayout(d)
+        vbox.addWidget(QLabel(_("Label (optional):")))
+        label_edit = QLineEdit()
+        label_edit.setPlaceholderText(_("e.g. Coffee stand"))
+        vbox.addWidget(label_edit)
+        memo_cb = QCheckBox(_("Allow payer-selected memos"))
+        memo_cb.setChecked(True)
+        memo_cb.setToolTip(_(
+            "When enabled, a note sent by the payer is folded into the invoice "
+            "memo. When disabled, the invoice always uses this offer's label."))
+        vbox.addWidget(memo_cb)
+        vbox.addLayout(Buttons(CancelButton(d), OkButton(d)))
+        label_edit.setFocus()
+        if not d.exec():
+            return None
+        return label_edit.text().strip(), memo_cb.isChecked()
+
     def _on_remove(self) -> None:
-        items = self.offers_list.selectedItems()
-        if not items:
+        offer_id = self._selected_offer_id()
+        if offer_id is None:
             return
-        self.plugin.remove_offer(items[0].text(1))
+        self.plugin.remove_offer(offer_id)
         self._refresh()
+
+    # -- inline edits (label rename + payer-memo toggle) ------------------
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        # Only the label column is user-editable; the rest are read-only.
+        if column == COL_LABEL:
+            self.offers_list.editItem(item, COL_LABEL)
+
+    def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if self._populating:
+            return
+        offer_id = item.data(COL_LABEL, OFFER_ID_ROLE)
+        if not offer_id:
+            return
+        if column == COL_LABEL:
+            self.plugin.set_offer_label(offer_id, item.text(COL_LABEL).strip())
+        elif column == COL_MEMO:
+            allow = item.checkState(COL_MEMO) == Qt.CheckState.Checked
+            self.plugin.set_offer_allow_payer_memo(offer_id, allow)
 
     def _on_copy(self) -> None:
         noffer = self._selected_noffer()
@@ -279,12 +390,28 @@ class ClinkTab(QWidget):
         self.identity_label.setText(
             _("Identity pubkey:") + f" {self.plugin.identity_pubkey or '—'}")
         selected = self._selected_noffer()
-        self.offers_list.clear()
-        for offer_id, info in self.plugin.list_offers().items():
-            item = QTreeWidgetItem([info["label"] or _("(no label)"), offer_id, info["noffer"]])
-            self.offers_list.addTopLevelItem(item)
-            if info["noffer"] == selected:
-                item.setSelected(True)
+        # Suppress itemChanged while we rebuild rows (setText/setCheckState fire it).
+        self._populating = True
+        try:
+            self.offers_list.clear()
+            for offer_id, info in self.plugin.list_offers().items():
+                item = QTreeWidgetItem([info["label"], "", offer_id, info["noffer"]])
+                item.setData(COL_LABEL, OFFER_ID_ROLE, offer_id)
+                item.setFlags(item.flags()
+                              | Qt.ItemFlag.ItemIsEditable
+                              | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(
+                    COL_MEMO,
+                    Qt.CheckState.Checked if info.get("allow_payer_memo", True)
+                    else Qt.CheckState.Unchecked)
+                item.setToolTip(COL_MEMO, _(
+                    "Allow a payer-supplied memo to be folded into the invoice. "
+                    "Click to toggle."))
+                self.offers_list.addTopLevelItem(item)
+                if info["noffer"] == selected:
+                    item.setSelected(True)
+        finally:
+            self._populating = False
         self._update_buttons()
         self._refresh_dynamic()
 

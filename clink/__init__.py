@@ -74,13 +74,15 @@ SimpleConfig.CLINK_DEVFEE_NOTICE_SHOWN = ConfigVar(
 
 
 @plugin_command("", plugin_name)
-async def add_offer(self: "Commands", label: str = "", plugin: "ClinkPlugin" = None) -> dict:
+async def add_offer(self: "Commands", label: str = "", allow_payer_memo: bool = True,
+                    plugin: "ClinkPlugin" = None) -> dict:
     """
     Create a new spontaneous offer and return its noffer string.
 
     arg:str:label:optional human label for the offer
+    arg:bool:allow_payer_memo:whether a payer's requested memo is folded into the invoice (default true)
     """
-    return plugin.create_offer(label)
+    return plugin.create_offer(label, allow_payer_memo)
 
 
 @plugin_command("", plugin_name)
@@ -89,6 +91,30 @@ async def list_offers(self: "Commands", plugin: "ClinkPlugin" = None) -> dict:
     List all offers with their noffer strings.
     """
     return plugin.list_offers()
+
+
+@plugin_command("", plugin_name)
+async def set_offer_label(self: "Commands", offer_id: str, label: str = "",
+                          plugin: "ClinkPlugin" = None) -> str:
+    """
+    Set (or clear) the human label of an existing offer.
+    arg:str:offer_id:offer id, see list_offers
+    arg:str:label:new label (omit to clear)
+    """
+    ok = plugin.set_offer_label(offer_id, label)
+    return f"updated {offer_id}" if ok else f"no such offer: {offer_id}"
+
+
+@plugin_command("", plugin_name)
+async def set_offer_payer_memo(self: "Commands", offer_id: str, allow: bool,
+                               plugin: "ClinkPlugin" = None) -> str:
+    """
+    Allow or disallow folding a payer-selected memo into invoices for an offer.
+    arg:str:offer_id:offer id, see list_offers
+    arg:bool:allow:true to honor payer memos, false to always use the label
+    """
+    ok = plugin.set_offer_allow_payer_memo(offer_id, allow)
+    return f"updated {offer_id}" if ok else f"no such offer: {offer_id}"
 
 
 @plugin_command("", plugin_name)

@@ -252,10 +252,11 @@ class ClinkServer(Logger, EventListener):
             await self.send_response(event, resolution.payload)
             return
 
+        # Fold in the payer's requested memo only when this offer permits it;
+        # otherwise the invoice carries just the merchant's label.
+        description = protocol.effective_description(offer, req)
         await self._issue_invoice(
-            event, offer, resolution.amount_sat,
-            protocol.request_description(req),
-        )
+            event, offer, resolution.amount_sat, description)
 
     def _record(self, offer_id: str, amount: Optional[int], result: str) -> None:
         self.recent_activity.append({
@@ -540,10 +541,11 @@ class ClinkPlugin(BasePlugin):
 
     # --- API used by cmdline + Qt ----------------------------------------
 
-    def create_offer(self, label: str = "") -> Dict[str, Any]:
+    def create_offer(self, label: str = "", allow_payer_memo: bool = True) -> Dict[str, Any]:
         assert self.server is not None, "wallet not loaded yet"
-        offer = self.server.offers.create(label=label)
+        offer = self.server.offers.create(label=label, allow_payer_memo=allow_payer_memo)
         return {"offer_id": offer.offer_id, "label": offer.label,
+                "allow_payer_memo": offer.allow_payer_memo,
                 "noffer": self.server.make_noffer(offer.offer_id)}
 
     def list_offers(self) -> Dict[str, Any]:
@@ -552,8 +554,17 @@ class ClinkPlugin(BasePlugin):
         if self.server is None:
             return {}
         return {o.offer_id: {"label": o.label, "active": o.active,
+                             "allow_payer_memo": o.allow_payer_memo,
                              "noffer": self.server.make_noffer(o.offer_id)}
                 for o in self.server.offers.list()}
+
+    def set_offer_label(self, offer_id: str, label: str) -> bool:
+        assert self.server is not None, "wallet not loaded yet"
+        return self.server.offers.set_label(offer_id, label)
+
+    def set_offer_allow_payer_memo(self, offer_id: str, allow: bool) -> bool:
+        assert self.server is not None, "wallet not loaded yet"
+        return self.server.offers.set_allow_payer_memo(offer_id, allow)
 
     def remove_offer(self, offer_id: str) -> bool:
         assert self.server is not None, "wallet not loaded yet"

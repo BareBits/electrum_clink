@@ -43,6 +43,32 @@ def test_set_active() -> None:
     assert OfferStore(storage).get(o.offer_id).active is False
 
 
+def test_set_label_persists() -> None:
+    storage: dict = {}
+    store = OfferStore(storage)
+    o = store.create(label="old")
+    assert store.set_label(o.offer_id, "new")
+    assert OfferStore(storage).get(o.offer_id).label == "new"
+    assert not store.set_label("nonexistent", "x")
+
+
+def test_allow_payer_memo_default_and_create() -> None:
+    store = OfferStore({})
+    assert store.create().allow_payer_memo is True
+    assert store.create(allow_payer_memo=False).allow_payer_memo is False
+
+
+def test_set_allow_payer_memo_persists() -> None:
+    storage: dict = {}
+    store = OfferStore(storage)
+    o = store.create()  # defaults to allowed
+    assert store.set_allow_payer_memo(o.offer_id, False)
+    assert OfferStore(storage).get(o.offer_id).allow_payer_memo is False
+    assert store.set_allow_payer_memo(o.offer_id, True)
+    assert OfferStore(storage).get(o.offer_id).allow_payer_memo is True
+    assert not store.set_allow_payer_memo("nonexistent", True)
+
+
 def test_offer_ids_are_unique() -> None:
     store = OfferStore({})
     ids = {store.create().offer_id for _ in range(50)}
@@ -55,3 +81,10 @@ def test_from_dict_defaults() -> None:
     assert o.offer_id == "abc"
     assert o.price_type == OfferPriceType.SPONTANEOUS
     assert o.active is True
+    # offers stored before the flag existed keep honoring payer memos
+    assert o.allow_payer_memo is True
+
+
+def test_allow_payer_memo_round_trips_through_dict() -> None:
+    o = Offer.from_dict(Offer(offer_id="x", allow_payer_memo=False).to_dict())
+    assert o.allow_payer_memo is False
