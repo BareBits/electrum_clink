@@ -27,7 +27,7 @@ from typing import Any, Dict
 
 import pytest
 
-from tests.clink_payer import request_invoice
+from tests.clink_payer import request_invoice, request_invoice_and_receipt
 
 pytestmark = pytest.mark.e2e
 
@@ -124,6 +124,23 @@ def test_happy_path_returns_payable_invoice(rig) -> None:
     resp = asyncio.run(request_invoice(noffer, amount_sats=amount, timeout=30))
     assert "bolt11" in resp, resp
     assert resp["bolt11"].lower().startswith("lnbcrt")
+
+
+def test_payment_receipt_delivered_after_payment(rig) -> None:
+    # Full round trip: request -> invoice -> pay it from LND -> the plugin should
+    # send the payer a kind-21001 {"res":"ok"} receipt on the same subscription.
+    noffer = _fresh_noffer()
+    available = _available_sat()
+    assert available > 0, "rig wallet should have inbound liquidity after seeding"
+    amount = max(1, min(1000, available // 2))
+    result = asyncio.run(request_invoice_and_receipt(
+        noffer, amount_sats=amount,
+        pay=lambda bolt11: _lnd_pay(bolt11, rig["lnd_grpc"]),
+        timeout=90,
+    ))
+    assert "bolt11" in result["invoice"], result
+    assert result["invoice"]["bolt11"].lower().startswith("lnbcrt")
+    assert result["receipt"] == {"res": "ok"}, result
 
 
 def test_over_capacity_returns_error_5(rig) -> None:
