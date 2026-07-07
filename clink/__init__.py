@@ -5,6 +5,45 @@ Registers the plugin's config vars and command-line API. The runtime lives in
 modules and are independently unit-tested.
 """
 
+# --- external-plugin loader shim (Electrum 4.7.x) --------------------------
+# When Electrum installs us from a zip, its loader registers this package in
+# ``sys.modules`` under ``electrum_external_plugins.clink`` but (a) never creates
+# the parent ``electrum_external_plugins`` namespace package and (b) leaves this
+# module's ``__name__``/``__package__`` as the bare in-zip name ``clink``. The
+# second bug is fatal: the first cross-module relative import in a submodule
+# (e.g. ``from . import nip44, protocol`` in clink_plugin) makes CPython build
+# the absolute child name from this package's ``__name__``, so it looks for a
+# top-level ``clink.nip44`` and raises ``ModuleNotFoundError: No module named
+# 'clink'``. We repair both here, before any submodule import runs, so the
+# distributed zip loads on a stock Electrum. The dev rig loads us as an internal
+# plugin instead, so this is inert there (the guard below only fires for the
+# zip-install identity).
+def _repair_external_plugin_identity() -> None:
+    import sys
+    import types
+
+    ns_name = "electrum_external_plugins"
+    full_name = f"{ns_name}.clink"
+    # Only act when we are *this* module registered under the external-zip key;
+    # never hijack an internal load (electrum.plugins.clink) or a plain import.
+    me = sys.modules.get(full_name)
+    if me is None or me.__dict__ is not globals():
+        return
+    if ns_name not in sys.modules:
+        ns = types.ModuleType(ns_name)
+        ns.__path__ = []  # namespace package with no on-disk location
+        sys.modules[ns_name] = ns
+    if __name__ != full_name:
+        globals()["__name__"] = full_name
+        globals()["__package__"] = full_name
+        if __spec__ is not None:
+            __spec__.name = full_name
+
+
+_repair_external_plugin_identity()
+del _repair_external_plugin_identity
+# ---------------------------------------------------------------------------
+
 from typing import TYPE_CHECKING
 
 from electrum.commands import plugin_command
