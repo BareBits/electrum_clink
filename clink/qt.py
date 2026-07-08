@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 
 from electrum.i18n import _
 from electrum.plugin import hook
+from electrum.util import UserCancelled
 from electrum.gui.qt.util import (
     Buttons, CancelButton, CloseButton, OkButton, WindowModalDialog, read_QIcon,
 )
@@ -311,7 +312,20 @@ class ClinkTab(QWidget):
         if result is None:
             return
         label, allow_memo = result
-        self.plugin.create_offer(label=label, allow_payer_memo=allow_memo)
+        # create_offer probes for a payable relay (cached 24h), so run it in a
+        # waiting dialog rather than freezing the tab.
+        try:
+            info = self.window.run_coroutine_dialog(
+                self.plugin.create_offer(label=label, allow_payer_memo=allow_memo),
+                _("Checking that a Nostr relay can carry this offer…"),
+            )
+        except UserCancelled:
+            return
+        except Exception as e:
+            self.window.show_error(_("Could not create offer: {}").format(e))
+            return
+        if isinstance(info, dict) and info.get("warning"):
+            self.window.show_warning(info["warning"], title=_("Offer may not be payable"))
         self._refresh()
 
     def _prompt_offer_details(self) -> Optional[tuple[str, bool]]:

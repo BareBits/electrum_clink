@@ -146,6 +146,29 @@ def test_happy_path_returns_payable_invoice(rig) -> None:
     assert resp["bolt11"].lower().startswith("lnbcrt")
 
 
+def test_created_offer_reports_payable_relay(rig) -> None:
+    """Offer creation must run the payability probe and advertise a relay it
+    verified — and that relay must actually round-trip an independent probe.
+
+    This is the deterministic, offline-of-the-public-internet counterpart to the
+    ``live_relay`` sweep: it proves the auto-pick + probe machinery end-to-end
+    against the rig's own relay."""
+    from clink.noffer import noffer_decode
+    from clink.relay_probe import ProbeStatus, probe_relay_payable
+
+    created = json.loads(_electrum_cli("clink_add_offer", "--label", "e2e"))
+    assert created["relay_payable"] is True, created
+    assert "warning" not in created, created
+
+    # The relay the offer reports is exactly the one baked into its noffer...
+    decoded = noffer_decode(created["noffer"])
+    assert decoded.relay == created["relay"]
+
+    # ...and an independent probe of that relay passes.
+    result = asyncio.run(probe_relay_payable(decoded.relay, timeout=15))
+    assert result.status is ProbeStatus.OK, result
+
+
 def test_issued_invoice_carries_requested_description(rig) -> None:
     """The plugin folds the payer's NIP-69 ``description`` into the bolt11 memo,
     combined with the offer label as ``"<label> - <description>"``.
