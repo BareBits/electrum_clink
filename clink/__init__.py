@@ -121,7 +121,7 @@ async def add_offer(self: "Commands", label: str = "", allow_payer_memo: bool = 
     arg:str:label:optional human label for the offer
     arg:bool:allow_payer_memo:whether a payer's requested memo is folded into the invoice (default true)
     """
-    return plugin.create_offer(label, allow_payer_memo)
+    return await plugin.create_offer(label, allow_payer_memo)
 
 
 @plugin_command("", plugin_name)
