@@ -14,7 +14,7 @@ import json
 import ssl
 import time
 from collections import OrderedDict, deque
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import electrum_aionostr as aionostr
 from electrum_aionostr.event import Event as nEvent
@@ -49,6 +49,13 @@ from .liquidity import LiquidityReserver, receivable_capacity_sat
 from .noffer import Noffer, OfferPriceType, noffer_encode
 from .offers import OfferStore
 from .receipts import RETRY_INTERVAL_SEC, ReceiptRegistry, ReceiptTarget
+from .relay_probe import (
+    ProbeResult,
+    RelaySelection,
+    probe_relay_payable,
+    select_payable_relay,
+)
+from .selftest import CheckResult, CheckStatus, check_noffer
 
 if TYPE_CHECKING:
     from electrum.simple_config import SimpleConfig
@@ -60,6 +67,12 @@ CLINK_VERSION = "1"
 MAX_REQUEST_AGE_SEC = 60
 # Cap on remembered request-event ids (replay guard) to bound memory.
 SEEN_EVENTS_MAX = 4096
+# How long a payable-relay selection is trusted before it is re-probed. The
+# user asked for a cap of 24h; a probe runs at offer creation when this lapses.
+RELAY_CACHE_TTL_SEC = 24 * 60 * 60
+# Self-test payer identities expire after this long even if the checker never
+# unregistered them (crash safety) — comfortably above the check timeout.
+SELFTEST_PAYER_TTL_SEC = 120
 
 
 class ClinkServer(Logger, EventListener):
@@ -101,6 +114,19 @@ class ClinkServer(Logger, EventListener):
         # Serialise payout attempts so a post-payment trigger can't race the
         # startup check into two concurrent sends.
         self._devfee_lock = asyncio.Lock()
+        # Cached payable-relay selection (see pick_payable_relay). None until the
+        # first probe; re-probed once older than RELAY_CACHE_TTL_SEC.
+        self._relay_selection: Optional[RelaySelection] = None
+        self._relay_selection_at: float = 0.0
+        self._relay_pick_lock = asyncio.Lock()
+        # Throwaway payer pubkeys of in-flight noffer self-tests (pubkey ->
+        # expiry). Requests from these are answered normally but their side
+        # effects are unwound — see _issue_invoice. Session-only by design.
+        self._selftest_payers: Dict[str, float] = {}
+        # Latest self-test results per offer id, plus the in-flight run (the Qt
+        # tab polls these; a second "Check noffers" click awaits the same run).
+        self.check_results: Dict[str, CheckResult] = {}
+        self._check_task: Optional["asyncio.Task[Dict[str, CheckResult]]"] = None
         self.register_callbacks()
 
     @staticmethod
@@ -110,12 +136,33 @@ class ClinkServer(Logger, EventListener):
 
     # --- config helpers --------------------------------------------------
 
+    def candidate_relays(self) -> List[str]:
+        """Relays to consider for a noffer, in preference order.
+
+        An explicit ``CLINK_RELAY`` override wins outright (the rig injects its
+        local relay this way); otherwise fall back to Electrum's validated global
+        ``NOSTR_RELAYS`` list, which the payability probe filters down to one that
+        actually works.
+        """
+        explicit = (self.config.CLINK_RELAY or "").strip()  # type: ignore[attr-defined]
+        if explicit:
+            return [explicit]
+        return list(self.config.get_nostr_relays())
+
     @property
     def relay_url(self) -> str:
-        relay = self.config.CLINK_RELAY  # type: ignore[attr-defined]
-        if not relay:
-            relay = (self.config.NOSTR_RELAYS.split(",") or [""])[0]
-        return relay.strip()
+        """First-choice relay before any payability probe (the raw fallback)."""
+        cands = self.candidate_relays()
+        return cands[0].strip() if cands else ""
+
+    @property
+    def effective_relay(self) -> str:
+        """The relay to advertise/listen on: the probed pick while it is fresh,
+        otherwise the raw first choice."""
+        sel = self._relay_selection
+        if sel and sel.relay and (time.time() - self._relay_selection_at) < RELAY_CACHE_TTL_SEC:
+            return sel.relay
+        return self.relay_url
 
     @property
     def invoice_expiry_sec(self) -> int:
@@ -125,27 +172,155 @@ class ClinkServer(Logger, EventListener):
         """Build the noffer string a payer scans for ``offer_id``."""
         return noffer_encode(Noffer(
             pubkey=self.pubkey_hex,
-            relay=self.relay_url,
+            relay=self.effective_relay,
             offer=offer_id,
             price_type=OfferPriceType.SPONTANEOUS,
         ))
+
+    def _proxy_factory(self) -> Optional[Callable[[], Any]]:
+        """A factory that mints a fresh aiohttp proxy connector, or None.
+
+        Returns a factory (not a connector) because a connector is single-use per
+        session and each relay manager needs its own.
+        """
+        network = self.wallet.lnworker.network if self.wallet.lnworker else None
+        if network and network.proxy and network.proxy.enabled:
+            return lambda: make_aiohttp_proxy_connector(network.proxy, self.ssl_context)
+        return None
+
+    async def pick_payable_relay(self, *, force: bool = False) -> RelaySelection:
+        """Return a payable relay, probing the candidates if the cache is stale.
+
+        The result is cached for ``RELAY_CACHE_TTL_SEC`` (24h). When the chosen
+        relay changes, the listener is restarted so the receiver waits on the same
+        relay every fresh noffer will advertise — the two must agree or the offer
+        is unpayable.
+        """
+        async with self._relay_pick_lock:
+            now = time.time()
+            cached = self._relay_selection
+            if (not force and cached is not None
+                    and (now - self._relay_selection_at) < RELAY_CACHE_TTL_SEC):
+                return cached
+
+            factory = self._proxy_factory()
+
+            async def _probe(relay: str) -> ProbeResult:
+                return await probe_relay_payable(
+                    relay, ssl_context=self.ssl_context, proxy_factory=factory)
+
+            prev_relay = self.effective_relay
+            sel = await select_payable_relay(self.candidate_relays(), probe=_probe)
+            self._relay_selection = sel
+            self._relay_selection_at = now
+            if not sel.ok:
+                self.logger.warning(
+                    "No configured Nostr relay accepted a CLINK test request; "
+                    "offers may be unpayable. Tried: "
+                    + ", ".join(r.relay for r in sel.results))
+            if sel.relay and sel.relay != prev_relay:
+                self.logger.info(f"CLINK relay selected: {sel.relay}")
+                self.restart_event_handler()
+            return sel
+
+    # --- noffer self-test ("Check noffers") --------------------------------
+
+    def register_selftest_payer(self, pubkey_hex: str) -> None:
+        """Mark ``pubkey_hex`` as an in-flight self-test payer identity.
+
+        Requests from it are answered through the normal path but their side
+        effects are unwound (see ``_issue_invoice``). Entries expire on their
+        own so a crashed check can never leave a permanent bypass behind.
+        """
+        self._selftest_payers[pubkey_hex] = time.time() + SELFTEST_PAYER_TTL_SEC
+
+    def unregister_selftest_payer(self, pubkey_hex: str) -> None:
+        self._selftest_payers.pop(pubkey_hex, None)
+
+    def is_selftest_payer(self, pubkey_hex: str) -> bool:
+        now = time.time()
+        expired = [pk for pk, exp in self._selftest_payers.items() if exp <= now]
+        for pk in expired:
+            del self._selftest_payers[pk]
+        return pubkey_hex in self._selftest_payers
+
+    def _validate_selftest_bolt11(self, bolt11: str, amount_sat: int) -> Optional[str]:
+        """Bolt11 validator injected into :func:`clink.selftest.check_noffer`.
+
+        Returns ``None`` when the invoice parses and carries the requested
+        amount, else a short problem description for the check result.
+        """
+        try:
+            invoice = Invoice.from_bech32(bolt11)
+        except Exception as e:
+            return f"invoice does not parse: {str(e)[:80]}"
+        got = invoice.get_amount_sat()
+        if got != amount_sat:
+            return f"invoice amount {got} sat != requested {amount_sat} sat"
+        return None
+
+    @property
+    def check_running(self) -> bool:
+        task = self._check_task
+        return task is not None and not task.done()
+
+    async def check_offers(self, offer_ids: Optional[List[str]] = None) -> Dict[str, CheckResult]:
+        """Round-trip self-test every listed offer's noffer; return per-offer results.
+
+        Results are also cached in ``self.check_results`` (session-only) for the
+        Qt tab. Concurrent calls coalesce onto the in-flight run instead of
+        publishing a second batch of requests.
+        """
+        if self._check_task is not None and not self._check_task.done():
+            return await asyncio.shield(self._check_task)
+        task = asyncio.ensure_future(self._run_offer_checks(offer_ids))
+        self._check_task = task
+        try:
+            return await task
+        finally:
+            if self._check_task is task:
+                self._check_task = None
+
+    async def _run_offer_checks(self, offer_ids: Optional[List[str]]) -> Dict[str, CheckResult]:
+        offers = [o for o in self.offers.list()
+                  if offer_ids is None or o.offer_id in offer_ids]
+        factory = self._proxy_factory()
+        results: Dict[str, CheckResult] = {}
+
+        async def check_one(offer) -> None:
+            # Test exactly the noffer string the table / QR shows for this offer.
+            noffer_str = self.make_noffer(offer.offer_id)
+            result = await check_noffer(
+                noffer_str,
+                ssl_context=self.ssl_context,
+                proxy_factory=factory,
+                validate_bolt11=self._validate_selftest_bolt11,
+                register_payer=self.register_selftest_payer,
+                unregister_payer=self.unregister_selftest_payer,
+            )
+            result.checked_at = time.time()
+            results[offer.offer_id] = result
+            self.check_results[offer.offer_id] = result
+
+        await asyncio.gather(*(check_one(o) for o in offers))
+        # Drop cached results for offers that were removed meanwhile.
+        live = {o.offer_id for o in self.offers.list()}
+        for offer_id in [k for k in self.check_results if k not in live]:
+            del self.check_results[offer_id]
+        return results
 
     # --- relay lifecycle (mirrors NWC) -----------------------------------
 
     def get_relay_manager(self) -> aionostr.Manager:
         assert get_asyncio_loop() == get_running_loop(), "ClinkServer must run in the aio event loop"
         nostr_logger = self.logger.getChild("aionostr")
-        network = self.wallet.lnworker.network
-        if network.proxy and network.proxy.enabled:
-            proxy = make_aiohttp_proxy_connector(network.proxy, self.ssl_context)
-        else:
-            proxy = None
+        factory = self._proxy_factory()
         return aionostr.Manager(
-            relays=[self.relay_url],
+            relays=[self.effective_relay],
             private_key=self.private_key.hex(),
             log=nostr_logger,
             ssl_context=self.ssl_context,
-            proxy=proxy,
+            proxy=factory() if factory else None,
         )
 
     @log_exceptions
@@ -206,7 +381,7 @@ class ClinkServer(Logger, EventListener):
             "since": int(time.time()),
             "limit": 0,
         }
-        self.logger.info(f"listening for offers on {self.relay_url} as {self.pubkey_hex}")
+        self.logger.info(f"listening for offers on {self.effective_relay} as {self.pubkey_hex}")
         async for event in self.manager.get_events(query, single_event=False, only_stored=False):
             try:
                 await self._dispatch(event)
@@ -244,11 +419,13 @@ class ClinkServer(Logger, EventListener):
             self.logger.debug("could not decrypt/parse clink request", exc_info=True)
             return
 
+        selftest = self.is_selftest_payer(event.pubkey)
         offer = self.offers.get(req.get("offer", ""))
         resolution = protocol.resolve_request(req, offer, self.reserver.available_sat())
         if isinstance(resolution, protocol.SendError):
             self._record(req.get("offer", ""), protocol.request_amount_sat(req),
-                         f"error {resolution.payload.get('code')}")
+                         f"error {resolution.payload.get('code')}"
+                         + (" (self-test)" if selftest else ""))
             await self.send_response(event, resolution.payload)
             return
 
@@ -256,7 +433,7 @@ class ClinkServer(Logger, EventListener):
         # otherwise the invoice carries just the merchant's label.
         description = protocol.effective_description(offer, req)
         await self._issue_invoice(
-            event, offer, resolution.amount_sat, description)
+            event, offer, resolution.amount_sat, description, selftest=selftest)
 
     def _record(self, offer_id: str, amount: Optional[int], result: str) -> None:
         self.recent_activity.append({
@@ -265,7 +442,8 @@ class ClinkServer(Logger, EventListener):
         })
 
     async def _issue_invoice(self, event: nEvent, offer, amount_sat: int,
-                             description: Optional[str] = None) -> None:
+                             description: Optional[str] = None, *,
+                             selftest: bool = False) -> None:
         expiry = self.invoice_expiry_sec
         # Honor the payer's requested memo (NIP-69 description), combined with
         # the merchant's offer label, so the invoice carries who-it's-for context
@@ -295,16 +473,24 @@ class ClinkServer(Logger, EventListener):
                 event, protocol.invalid_amount_payload(1, self.reserver.available_sat()))
             return
 
-        # Remember this hash so the dev fee accrues if (and only if) it is paid.
-        self.devfee.mark_issued(request.rhash)
-        # Remember who to send the payment receipt to once this invoice settles.
-        self.receipts.remember(request.rhash, event.pubkey, event.id,
-                               expires_at=time.time() + expiry)
-
-        self.logger.info(f"issued {amount_sat} sat invoice for offer {req_offer_id(offer)} "
-                         f"(rhash={request.rhash[:10]}…), liquidity locked for {expiry}s")
-        self._record(req_offer_id(offer), amount_sat, "invoice issued")
+        if not selftest:
+            # Remember this hash so the dev fee accrues if (and only if) it is paid.
+            self.devfee.mark_issued(request.rhash)
+            # Remember who to send the payment receipt to once this invoice settles.
+            self.receipts.remember(request.rhash, event.pubkey, event.id,
+                                   expires_at=time.time() + expiry)
+            self.logger.info(f"issued {amount_sat} sat invoice for offer {req_offer_id(offer)} "
+                             f"(rhash={request.rhash[:10]}…), liquidity locked for {expiry}s")
+            self._record(req_offer_id(offer), amount_sat, "invoice issued")
         await self.send_response(event, protocol.success_payload(bolt11))
+        if selftest:
+            # A real invoice went over the wire (that is what the check proves),
+            # but nobody will ever pay it: unwind the side effects right away so
+            # a self-test never holds liquidity or leaves a request behind.
+            self.reserver.release(request.rhash)
+            self.wallet.delete_request(key)
+            self.logger.info(f"answered noffer self-test for offer {req_offer_id(offer)}")
+            self._record(req_offer_id(offer), amount_sat, "self-test ✓")
 
     def _encrypt_event_args(self, to_pubkey: str, request_event_id: str,
                             payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -541,12 +727,26 @@ class ClinkPlugin(BasePlugin):
 
     # --- API used by cmdline + Qt ----------------------------------------
 
-    def create_offer(self, label: str = "", allow_payer_memo: bool = True) -> Dict[str, Any]:
+    async def create_offer(self, label: str = "", allow_payer_memo: bool = True) -> Dict[str, Any]:
         assert self.server is not None, "wallet not loaded yet"
+        # Probe (cached 24h) before building the noffer so its single embedded
+        # relay is one a payer can actually reach — see clink.relay_probe.
+        selection = await self.server.pick_payable_relay()
         offer = self.server.offers.create(label=label, allow_payer_memo=allow_payer_memo)
-        return {"offer_id": offer.offer_id, "label": offer.label,
-                "allow_payer_memo": offer.allow_payer_memo,
-                "noffer": self.server.make_noffer(offer.offer_id)}
+        result: Dict[str, Any] = {
+            "offer_id": offer.offer_id, "label": offer.label,
+            "allow_payer_memo": offer.allow_payer_memo,
+            "noffer": self.server.make_noffer(offer.offer_id),
+            "relay": selection.relay,
+            "relay_payable": selection.ok,
+        }
+        if not selection.ok:
+            tried = ", ".join(r.relay for r in selection.results) or "(none configured)"
+            result["warning"] = (
+                "No Nostr relay accepted a test payment request, so this offer "
+                f"may not be payable. Tried: {tried}. Set a working relay in the "
+                "CLINK settings and create the offer again.")
+        return result
 
     def list_offers(self) -> Dict[str, Any]:
         # Read-only status getters tolerate a missing server (wallet not yet
@@ -569,6 +769,24 @@ class ClinkPlugin(BasePlugin):
     def remove_offer(self, offer_id: str) -> bool:
         assert self.server is not None, "wallet not loaded yet"
         return self.server.offers.remove(offer_id)
+
+    async def check_noffers(self, offer_id: Optional[str] = None) -> Dict[str, Any]:
+        """Self-test the noffer of one offer (or all offers) end to end.
+
+        Returns ``{offer_id: result_dict}`` — see :class:`clink.selftest.CheckResult`.
+        """
+        assert self.server is not None, "wallet not loaded yet"
+        results = await self.server.check_offers([offer_id] if offer_id else None)
+        return {oid: res.to_dict() for oid, res in results.items()}
+
+    def noffer_check_results(self) -> Dict[str, "CheckResult"]:
+        """Latest session-only self-test results per offer id (may be empty)."""
+        if self.server is None:
+            return {}
+        return dict(self.server.check_results)
+
+    def noffer_check_running(self) -> bool:
+        return self.server is not None and self.server.check_running
 
     def liquidity_status(self) -> Dict[str, Any]:
         if self.server is None:

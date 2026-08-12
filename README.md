@@ -27,6 +27,14 @@ An *optional* .1% dev fee is included by default, which can be disabled in the s
 * **Generate noffers.** Each offer is a *spontaneous* offer (the payer names the
   amount). The plugin derives a stable Nostr identity from the wallet's
   Lightning node key, so a wallet's noffers survive restarts.
+* **Payable-relay auto-pick.** A noffer embeds exactly one relay, and the
+  reference payer connects to *only* that relay — so a dead relay yields a noffer
+  that looks fine but is silently unpayable. When you create an offer (unless you
+  pin `plugins.clink.relay`), the plugin probes your configured relays with a
+  real kind-`21001` write/read-back round-trip and embeds the first one that
+  works, restarting its listener onto the same relay. The result is cached for
+  24h; if none pass, the offer is still created but flagged as possibly
+  unpayable. See `relay_probe.py`.
 * **Answer requests.** It subscribes to its relay for kind-`21001` requests,
   NIP-44-decrypts them, and replies with a BOLT-11 invoice — or a structured
   error (NIP-69 codes) when it can't fulfil the request.
@@ -45,6 +53,14 @@ An *optional* .1% dev fee is included by default, which can be disabled in the s
   so two concurrent requests can't both be promised the same capacity. A request
   that exceeds available (unreserved) capacity gets `error code 5` with the
   acceptable range.
+* **Check noffers.** The CLINK tab's "Check noffers" button (and the
+  `clink_check_noffers` CLI command) self-tests every offer end to end: the
+  plugin plays payer with a throwaway Nostr identity — connect to the noffer's
+  embedded relay, send a real encrypted offer request, and verify a valid
+  invoice comes back. Results appear in the table's Status column (session-only,
+  timestamped). The self-test invoice is unwound immediately: no liquidity is
+  held, no wallet request, receipt, or dev-fee entry is left behind. See
+  `selftest.py`.
 * **Debits / management** (`ndebit` / `nmanage`) are **not** implemented yet;
   they are stubbed via the protocol's "unsupported feature" path so they can be
   added without restructuring.
@@ -57,6 +73,8 @@ clink/                 # the importable plugin package (this is what ships)
   manifest.json        # plugin metadata (available_for: cmdline, qt)
   clink_plugin.py      # runtime: relay loop + request handler + liquidity lock
   noffer.py            # noffer bech32/TLV codec (byte-identical to @shocknet/clink-sdk)
+  relay_probe.py       # payability probe: pick a relay a payer can actually reach
+  selftest.py          # noffer round-trip self-test ("Check noffers")
   nip44.py             # NIP-44 v2 (validated against the official vectors)
   liquidity.py         # inbound-liquidity reservation
   receipts.py          # persisted payment-receipt registry (retry across restarts)
@@ -75,7 +93,7 @@ dependencies**.
 
 | Config key | Default | Meaning |
 |---|---|---|
-| `plugins.clink.relay` | `""` (falls back to `NOSTR_RELAYS[0]`) | relay encoded in noffers + subscribed to |
+| `plugins.clink.relay` | `""` (auto-picks a working relay from `NOSTR_RELAYS`) | relay encoded in noffers + subscribed to |
 | `plugins.clink.invoice_expiry_sec` | `120` | invoice lifetime **and** liquidity-lock window |
 | `plugins.clink.devfee_enabled` | `true` | collect the optional dev fee (opt-out) |
 | `plugins.clink.devfee_rate_percent` | `0.1` | dev-fee rate, % of each inbound payment (0.001–5) |
@@ -102,6 +120,8 @@ electrum clink_list_offers
 electrum clink_set_offer_label <offer_id> --label "tea"   # rename an offer
 electrum clink_set_offer_payer_memo <offer_id> false      # allow/disallow payer memos
 electrum clink_remove_offer <offer_id>
+electrum clink_check_noffers                # self-test every noffer end to end
+electrum clink_check_noffers --offer_id <offer_id>  # ...or just one
 electrum clink_clink_status                 # available / reserved liquidity
 electrum clink_devfee_status                # dev-fee settings + owed balance
 electrum clink_devfee_pay                   # force a payout now (testing)
@@ -112,7 +132,15 @@ electrum clink_devfee_pay                   # force a payout now (testing)
 ```bash
 pytest                 # unit tests (offline, fast)
 pytest -m e2e          # end-to-end against the regtest rig (slow, needs the rig)
+pytest -m live_relay   # probe the real default relays over the network (flaky, opt-in)
 ```
+
+Relay payability is checked at three levels: `test_relay_probe.py` unit-tests the
+probe/selection logic offline; the e2e suite proves a freshly created offer
+advertises a relay that round-trips against the rig's own relay; and the opt-in
+`live_relay` sweep asserts at least one of Electrum's shipped default relays can
+actually carry CLINK traffic, printing a per-relay report so a stale default can
+be spotted and pruned.
 
 Unit tests anchor the crypto on authoritative vectors: `noffer` encoding is
 byte-checked against `@shocknet/clink-sdk` output, and NIP-44 v2 against the

@@ -7,9 +7,10 @@ invoice-expiry / liquidity-lock window, and see a log of recent requests.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from datetime import datetime
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QPixmap, QImage
@@ -22,12 +23,15 @@ from PyQt6.QtWidgets import (
 
 from electrum.i18n import _
 from electrum.plugin import hook
+from electrum.util import UserCancelled, get_asyncio_loop
 from electrum.gui.qt.util import (
     Buttons, CancelButton, CloseButton, OkButton, WindowModalDialog, read_QIcon,
 )
 from electrum.gui.common_qt.util import paintQR
 
+from . import protocol
 from .clink_plugin import ClinkPlugin
+from .selftest import CheckResult, CheckStatus
 
 # Dev-fee slider bounds (percent). The slider is log-scaled so the low end
 # (0.001%–0.1%) is as easy to set as the high end.
@@ -69,6 +73,7 @@ COL_LABEL = 0
 COL_MEMO = 1
 COL_OFFER = 2
 COL_NOFFER = 3
+COL_STATUS = 4
 
 # offer_id is stashed on the row (column 0) so label edits never lose the key.
 OFFER_ID_ROLE = Qt.ItemDataRole.UserRole
@@ -159,7 +164,7 @@ class ClinkTab(QWidget):
         root.addWidget(QLabel(_("Offers (double-click a label to rename):")))
         self.offers_list = QTreeWidget()
         self.offers_list.setHeaderLabels(
-            [_("Label"), _("Payer memo"), _("Offer id"), _("noffer")])
+            [_("Label"), _("Payer memo"), _("Offer id"), _("noffer"), _("Status")])
         self.offers_list.setRootIsDecorated(False)
         self.offers_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         # We drive editing ourselves (only the label column, on double-click), so
@@ -167,6 +172,7 @@ class ClinkTab(QWidget):
         self.offers_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.offers_list.header().setSectionResizeMode(COL_NOFFER, QHeaderView.ResizeMode.Stretch)
         self.offers_list.header().setSectionResizeMode(COL_MEMO, QHeaderView.ResizeMode.ResizeToContents)
+        self.offers_list.header().setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
         self.offers_list.itemSelectionChanged.connect(self._update_buttons)
         self.offers_list.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.offers_list.itemChanged.connect(self._on_item_changed)
@@ -176,11 +182,17 @@ class ClinkTab(QWidget):
         new_btn.clicked.connect(self._on_new_offer)
         self.qr_btn = QPushButton(_("Show noffer / QR"))
         self.qr_btn.clicked.connect(self._on_show_qr)
+        self.check_btn = QPushButton(_("Check noffers"))
+        self.check_btn.setToolTip(_(
+            "Verify each noffer end to end: connect to its relay as a payer, "
+            "send a test offer request, and confirm a valid invoice comes back."))
+        self.check_btn.clicked.connect(self._on_check_noffers)
         self.copy_btn = QPushButton(_("Copy noffer"))
         self.copy_btn.clicked.connect(self._on_copy)
         self.remove_btn = QPushButton(_("Remove"))
         self.remove_btn.clicked.connect(self._on_remove)
-        root.addLayout(Buttons(new_btn, self.qr_btn, self.copy_btn, self.remove_btn))
+        root.addLayout(Buttons(new_btn, self.qr_btn, self.check_btn,
+                               self.copy_btn, self.remove_btn))
 
         # --- recent activity --------------------------------------------
         root.addWidget(QLabel(_("Recent requests:")))
@@ -311,7 +323,20 @@ class ClinkTab(QWidget):
         if result is None:
             return
         label, allow_memo = result
-        self.plugin.create_offer(label=label, allow_payer_memo=allow_memo)
+        # create_offer probes for a payable relay (cached 24h), so run it in a
+        # waiting dialog rather than freezing the tab.
+        try:
+            info = self.window.run_coroutine_dialog(
+                self.plugin.create_offer(label=label, allow_payer_memo=allow_memo),
+                _("Checking that a Nostr relay can carry this offer…"),
+            )
+        except UserCancelled:
+            return
+        except Exception as e:
+            self.window.show_error(_("Could not create offer: {}").format(e))
+            return
+        if isinstance(info, dict) and info.get("warning"):
+            self.window.show_warning(info["warning"], title=_("Offer may not be payable"))
         self._refresh()
 
     def _prompt_offer_details(self) -> Optional[tuple[str, bool]]:
@@ -365,6 +390,91 @@ class ClinkTab(QWidget):
             QApplication.clipboard().setText(noffer)
             self.window.show_message(_("noffer copied to clipboard"))
 
+    # -- noffer self-test --------------------------------------------------
+    def _on_check_noffers(self) -> None:
+        if not self.plugin.list_offers():
+            self.window.show_message(_("No offers to check yet."))
+            return
+        if self.plugin.noffer_check_running():
+            return  # button is disabled while a run is live; belt and braces
+        # Fire the check on the asyncio loop; the 2s poller renders "Checking…"
+        # rows and the results as they land, and re-enables the button. Errors
+        # are logged rather than raised into Qt (per-offer failures are already
+        # folded into each offer's result).
+        future = asyncio.run_coroutine_threadsafe(
+            self.plugin.check_noffers(), get_asyncio_loop())
+        future.add_done_callback(self._on_check_done)
+        self._refresh_dynamic()
+
+    def _on_check_done(self, future) -> None:
+        # Runs on the asyncio thread — no Qt calls here; the poller repaints.
+        try:
+            future.result()
+        except Exception as e:
+            self.plugin.logger.info(f"noffer check failed: {e!r}")
+
+    def _status_cell(self, result: Optional[CheckResult]) -> Tuple[str, str]:
+        """Render one offer's self-test result as (cell text, tooltip)."""
+        if self.plugin.noffer_check_running():
+            return _("Checking…"), _("A noffer check is in progress.")
+        if result is None:
+            return "—", _("Not checked yet. Press \"Check noffers\".")
+        when = datetime.fromtimestamp(result.checked_at).strftime("%H:%M")
+        rtt = f" in {result.rtt_ms/1000:.1f}s" if result.rtt_ms is not None else ""
+        if result.status is CheckStatus.OK:
+            return (_("✓ OK ({})").format(when),
+                    _("Round trip succeeded{}: the relay carried the request and "
+                      "a valid invoice came back.").format(rtt))
+        if result.status is CheckStatus.LISTENER_ERROR:
+            # The round trip itself worked — the service answered with a CLINK
+            # error. Surface the two commonest causes in plain words.
+            if result.error_code == protocol.ERR_INVALID_AMOUNT:
+                return (_("⚠ No inbound liquidity ({})").format(when),
+                        _("The noffer round trip works, but the wallet cannot "
+                          "receive even 1 sat right now, so payers get an "
+                          "error. Open a channel or free up inbound capacity."))
+            if result.error_code == protocol.ERR_INVALID_OFFER:
+                return (_("✗ Unknown offer ({})").format(when),
+                        _("The service answered, but does not know this offer."))
+            return (_("⚠ Service error ({})").format(when),
+                    _("The service replied with an error: {} (code {})").format(
+                        result.detail or "?", result.error_code))
+        text = {
+            CheckStatus.UNREACHABLE: _("✗ Relay unreachable ({})"),
+            CheckStatus.PUBLISH_FAILED: _("✗ Relay refused request ({})"),
+            CheckStatus.NO_RESPONSE: _("✗ No response ({})"),
+            CheckStatus.BAD_RESPONSE: _("✗ Invalid response ({})"),
+            CheckStatus.INVALID_NOFFER: _("✗ Invalid noffer ({})"),
+        }.get(result.status, _("✗ Check failed ({})")).format(when)
+        tooltip = {
+            CheckStatus.UNREACHABLE: _(
+                "Could not connect to the relay this noffer advertises. "
+                "Payers cannot reach you through it."),
+            CheckStatus.PUBLISH_FAILED: _(
+                "Connected, but the relay refused the test payment request."),
+            CheckStatus.NO_RESPONSE: _(
+                "The relay accepted the request but no reply arrived — the "
+                "plugin's listener may not be connected to this relay."),
+            CheckStatus.BAD_RESPONSE: _("A reply arrived but was not valid."),
+            CheckStatus.INVALID_NOFFER: _("This noffer string does not decode."),
+        }.get(result.status, result.detail or _("Unexpected failure while checking."))
+        if result.detail and result.status not in (CheckStatus.INVALID_NOFFER,):
+            tooltip += f"\n{result.detail}"
+        return text, tooltip
+
+    def _refresh_check_column(self) -> None:
+        results = self.plugin.noffer_check_results()
+        self.check_btn.setText(
+            _("Checking…") if self.plugin.noffer_check_running() else _("Check noffers"))
+        self.check_btn.setEnabled(not self.plugin.noffer_check_running())
+        for i in range(self.offers_list.topLevelItemCount()):
+            item = self.offers_list.topLevelItem(i)
+            offer_id = item.data(COL_LABEL, OFFER_ID_ROLE)
+            text, tooltip = self._status_cell(results.get(offer_id))
+            if item.text(COL_STATUS) != text:
+                item.setText(COL_STATUS, text)
+            item.setToolTip(COL_STATUS, tooltip)
+
     def _on_show_qr(self) -> None:
         noffer = self._selected_noffer()
         if not noffer:
@@ -395,7 +505,7 @@ class ClinkTab(QWidget):
         try:
             self.offers_list.clear()
             for offer_id, info in self.plugin.list_offers().items():
-                item = QTreeWidgetItem([info["label"], "", offer_id, info["noffer"]])
+                item = QTreeWidgetItem([info["label"], "", offer_id, info["noffer"], ""])
                 item.setData(COL_LABEL, OFFER_ID_ROLE, offer_id)
                 item.setFlags(item.flags()
                               | Qt.ItemFlag.ItemIsEditable
@@ -439,3 +549,5 @@ class ClinkTab(QWidget):
         devfee = self.plugin.devfee_status()
         self.devfee_owed_label.setText(_("Owed: {} sat — forwarded to {}").format(
             devfee["owed_sat"], devfee["destination"] or "—"))
+
+        self._refresh_check_column()

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "electrum-clink-plugin"
-version = "0.0.1"
+version = "0.0.2"
 description = "CLINK offers plugin for Electrum: generate noffers and answer requests with Lightning invoices over Nostr."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,8 @@ packages = ["clink"]
 testpaths = ["tests"]
 markers = [
     "e2e: end-to-end tests that boot the regtest rig (slow; require the rig checkout)",
+    "live_relay: probes real public Nostr relays over the network (flaky; opt-in)",
 ]
-# Unit tests run by default; opt into e2e explicitly with `-m e2e`.
-addopts = "-m 'not e2e'"
+# Unit tests run by default; opt into the slow/network suites explicitly with
+# `-m e2e` or `-m live_relay`.
+addopts = "-m 'not e2e and not live_relay'"

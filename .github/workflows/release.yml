@@ -1,15 +1,16 @@
-name: Release latest
+name: Release
 
-# Build the Electrum external-plugin zip on every push to main and publish it
-# as a single rolling "latest" prerelease (the tag is re-pointed each run).
+# Versioned releases: pushing a tag like v0.0.2 builds the Electrum
+# external-plugin zip and publishes it as a permanent GitHub release for that
+# tag. The tag must match the version in clink/manifest.json (checked below),
+# so a released zip is always traceable to its exact source.
+#
+# To cut a release:
+#   1. bump "version" in clink/manifest.json on main
+#   2. git tag v<version> && git push origin v<version>
 on:
   push:
-    branches: [main]
-
-# Newest push wins; cancel an in-flight release that an older commit started.
-concurrency:
-  group: release-latest
-  cancel-in-progress: true
+    tags: ["v*"]
 
 permissions:
   contents: write
@@ -32,20 +33,24 @@ jobs:
           version=$(python -c "import json; print(json.load(open('clink/manifest.json'))['version'])")
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Publish rolling "latest" release
+      - name: Check tag matches manifest version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${{ steps.build.outputs.version }}"
+          if [ "$tag" != "v$version" ]; then
+            echo "Tag $tag does not match manifest version v$version" >&2
+            exit 1
+          fi
+
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # gh won't move an existing tag, so drop the previous rolling release
-          # and its tag, then recreate "latest" pointing at this commit.
-          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
-          gh release create latest dist/clink-*.zip \
+          gh release create "$GITHUB_REF_NAME" dist/clink-*.zip \
             --target "$GITHUB_SHA" \
-            --title "Latest build (v${{ steps.build.outputs.version }})" \
-            --prerelease \
-            --notes "Automated build of \`main\` at commit ${GITHUB_SHA:0:7} (plugin version ${{ steps.build.outputs.version }}).
+            --title "CLINK plugin ${GITHUB_REF_NAME}" \
+            --notes "CLINK plugin version ${{ steps.build.outputs.version }} (commit ${GITHUB_SHA:0:7}).
 
-          Install in Electrum via **Tools -> Plugins -> Add** using the attached zip.
-
-          > Rolling build: this release is overwritten on every push to \`main\`."
+          Install in Electrum via **Tools -> Plugins -> Add** using the attached zip."

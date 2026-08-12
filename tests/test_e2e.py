@@ -146,6 +146,29 @@ def test_happy_path_returns_payable_invoice(rig) -> None:
     assert resp["bolt11"].lower().startswith("lnbcrt")
 
 
+def test_created_offer_reports_payable_relay(rig) -> None:
+    """Offer creation must run the payability probe and advertise a relay it
+    verified — and that relay must actually round-trip an independent probe.
+
+    This is the deterministic, offline-of-the-public-internet counterpart to the
+    ``live_relay`` sweep: it proves the auto-pick + probe machinery end-to-end
+    against the rig's own relay."""
+    from clink.noffer import noffer_decode
+    from clink.relay_probe import ProbeStatus, probe_relay_payable
+
+    created = json.loads(_electrum_cli("clink_add_offer", "--label", "e2e"))
+    assert created["relay_payable"] is True, created
+    assert "warning" not in created, created
+
+    # The relay the offer reports is exactly the one baked into its noffer...
+    decoded = noffer_decode(created["noffer"])
+    assert decoded.relay == created["relay"]
+
+    # ...and an independent probe of that relay passes.
+    result = asyncio.run(probe_relay_payable(decoded.relay, timeout=15))
+    assert result.status is ProbeStatus.OK, result
+
+
 def test_issued_invoice_carries_requested_description(rig) -> None:
     """The plugin folds the payer's NIP-69 ``description`` into the bolt11 memo,
     combined with the offer label as ``"<label> - <description>"``.
@@ -213,6 +236,58 @@ def test_issued_invoice_locks_liquidity(rig) -> None:
     # proving the first invoice locked the inbound liquidity.
     second = asyncio.run(request_invoice(noffer, amount_sats=available, timeout=30))
     assert second.get("code") == 5, second
+
+
+def test_check_noffers_round_trips_and_leaves_no_trace(rig) -> None:
+    """"Check noffers" (clink_check_noffers) self-tests offers end to end.
+
+    Two fresh offers must both come back ``ok`` with a measured round-trip time
+    through the rig's real relay and the plugin's live listener — and the check
+    must leave nothing behind in the wallet: no liquidity reservation, no owed
+    receipt, no payment request. The single-offer form checks exactly one.
+
+    (The unreachable-relay failure path lives in the rig repo's own e2e suite,
+    which boots a private stack it can kill the relay of; here the rig fixture
+    is shared with the other tests, so we keep the relay alive.)
+    """
+    # The locking test just before this one may still hold (all of) the inbound
+    # liquidity; the self-test requests 1 sat, so wait for that much to free up
+    # (reservations expire after the 120s invoice-expiry window).
+    deadline = time.monotonic() + 150
+    while _available_sat() < 1 and time.monotonic() < deadline:
+        time.sleep(3)
+    assert _available_sat() >= 1, "no inbound liquidity freed up for the self-test"
+
+    first = json.loads(_electrum_cli("clink_add_offer", "--label", "check-e2e"))
+    second = json.loads(_electrum_cli("clink_add_offer", "--label", "check-e2e"))
+    status_before = json.loads(_electrum_cli("clink_clink_status"))
+
+    results = json.loads(_electrum_cli("clink_check_noffers"))
+    for created in (first, second):
+        res = results[created["offer_id"]]
+        assert res["ok"] is True and res["status"] == "ok", res
+        assert res["rtt_ms"] is not None and res["rtt_ms"] > 0, res
+        assert res["noffer"] == created["noffer"], res
+        assert res["checked_at"] > 0, res
+
+    # No trace left behind: no new reservation or owed receipt (<= because a
+    # leftover reservation from an earlier test may *expire* while we check),
+    # and no wallet payment request bearing the self-test offers' label.
+    status_after = json.loads(_electrum_cli("clink_clink_status"))
+    assert status_after["active_reservations"] <= status_before["active_reservations"], status_after
+    assert status_after["owed_receipts"] <= status_before["owed_receipts"], status_after
+    # list_requests is wallet-scoped: unlike the clink_* plugin commands it
+    # needs -w (this harness does not pin one the way the rig's helper does).
+    wallet = RIG_DIR / ".run" / "electrum" / "regtest" / "wallets" / "clink_test"
+    requests = json.loads(_electrum_cli("-w", str(wallet), "list_requests"))
+    assert not any("check-e2e" in (r.get("message") or "") for r in requests), \
+        "self-test left a payment request behind"
+
+    # Single-offer form checks exactly that offer.
+    single = json.loads(_electrum_cli(
+        "clink_check_noffers", "--offer_id", first["offer_id"]))
+    assert list(single) == [first["offer_id"]]
+    assert single[first["offer_id"]]["ok"] is True
 
 
 def test_devfee_accrues_and_pays_out(rig) -> None:

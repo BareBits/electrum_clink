@@ -121,7 +121,7 @@ async def add_offer(self: "Commands", label: str = "", allow_payer_memo: bool = 
     arg:str:label:optional human label for the offer
     arg:bool:allow_payer_memo:whether a payer's requested memo is folded into the invoice (default true)
     """
-    return plugin.create_offer(label, allow_payer_memo)
+    return await plugin.create_offer(label, allow_payer_memo)
 
 
 @plugin_command("", plugin_name)
@@ -164,6 +164,18 @@ async def remove_offer(self: "Commands", offer_id: str, plugin: "ClinkPlugin" = 
     """
     ok = plugin.remove_offer(offer_id)
     return f"removed {offer_id}" if ok else f"no such offer: {offer_id}"
+
+
+@plugin_command("", plugin_name)
+async def check_noffers(self: "Commands", offer_id: str = "",
+                        plugin: "ClinkPlugin" = None) -> dict:
+    """
+    Verify each offer's noffer is payable end to end: connect to its relay as a
+    throwaway payer, send a real (side-effect-free) offer request, and report
+    whether a valid invoice came back. Returns {offer_id: result}.
+    arg:str:offer_id:check only this offer (omit to check all)
+    """
+    return await plugin.check_noffers(offer_id or None)
 
 
 @plugin_command("", plugin_name)
