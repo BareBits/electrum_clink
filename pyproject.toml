@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "electrum-clink-plugin"
-version = "0.0.1"
+version = "0.0.2"
 description = "CLINK offers plugin for Electrum: generate noffers and answer requests with Lightning invoices over Nostr."
 readme = "README.md"
 requires-python = ">=3.10"
