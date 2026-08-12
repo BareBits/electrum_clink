@@ -53,6 +53,14 @@ An *optional* .1% dev fee is included by default, which can be disabled in the s
   so two concurrent requests can't both be promised the same capacity. A request
   that exceeds available (unreserved) capacity gets `error code 5` with the
   acceptable range.
+* **Check noffers.** The CLINK tab's "Check noffers" button (and the
+  `clink_check_noffers` CLI command) self-tests every offer end to end: the
+  plugin plays payer with a throwaway Nostr identity — connect to the noffer's
+  embedded relay, send a real encrypted offer request, and verify a valid
+  invoice comes back. Results appear in the table's Status column (session-only,
+  timestamped). The self-test invoice is unwound immediately: no liquidity is
+  held, no wallet request, receipt, or dev-fee entry is left behind. See
+  `selftest.py`.
 * **Debits / management** (`ndebit` / `nmanage`) are **not** implemented yet;
   they are stubbed via the protocol's "unsupported feature" path so they can be
   added without restructuring.
@@ -66,6 +74,7 @@ clink/                 # the importable plugin package (this is what ships)
   clink_plugin.py      # runtime: relay loop + request handler + liquidity lock
   noffer.py            # noffer bech32/TLV codec (byte-identical to @shocknet/clink-sdk)
   relay_probe.py       # payability probe: pick a relay a payer can actually reach
+  selftest.py          # noffer round-trip self-test ("Check noffers")
   nip44.py             # NIP-44 v2 (validated against the official vectors)
   liquidity.py         # inbound-liquidity reservation
   receipts.py          # persisted payment-receipt registry (retry across restarts)
@@ -111,6 +120,8 @@ electrum clink_list_offers
 electrum clink_set_offer_label <offer_id> --label "tea"   # rename an offer
 electrum clink_set_offer_payer_memo <offer_id> false      # allow/disallow payer memos
 electrum clink_remove_offer <offer_id>
+electrum clink_check_noffers                # self-test every noffer end to end
+electrum clink_check_noffers --offer_id <offer_id>  # ...or just one
 electrum clink_clink_status                 # available / reserved liquidity
 electrum clink_devfee_status                # dev-fee settings + owed balance
 electrum clink_devfee_pay                   # force a payout now (testing)

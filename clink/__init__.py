@@ -167,6 +167,18 @@ async def remove_offer(self: "Commands", offer_id: str, plugin: "ClinkPlugin" = 
 
 
 @plugin_command("", plugin_name)
+async def check_noffers(self: "Commands", offer_id: str = "",
+                        plugin: "ClinkPlugin" = None) -> dict:
+    """
+    Verify each offer's noffer is payable end to end: connect to its relay as a
+    throwaway payer, send a real (side-effect-free) offer request, and report
+    whether a valid invoice came back. Returns {offer_id: result}.
+    arg:str:offer_id:check only this offer (omit to check all)
+    """
+    return await plugin.check_noffers(offer_id or None)
+
+
+@plugin_command("", plugin_name)
 async def clink_status(self: "Commands", plugin: "ClinkPlugin" = None) -> dict:
     """
     Show receivable/reserved inbound liquidity and active reservations.
