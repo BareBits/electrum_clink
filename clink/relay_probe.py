@@ -31,6 +31,7 @@ import ssl
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, List, Optional, Sequence
+from urllib.parse import urlsplit
 
 import electrum_aionostr as aionostr
 from electrum_aionostr.key import PrivateKey
@@ -47,6 +48,33 @@ SUBSCRIBE_SETTLE_SEC = 0.3
 # Marker embedded in the probe event's content so a shared relay can't hand us
 # an unrelated event and pass the probe by accident.
 PROBE_CONTENT_PREFIX = "clink-relay-probe:"
+
+
+def normalize_relay_url(url: str) -> str:
+    """Validate a user-supplied relay URL (``wss://myrelay.com:port``).
+
+    Returns the stripped URL, or raises ``ValueError`` naming the problem.
+    Shared by the Qt "New offer" dialog and the CLI so a typo'd relay is
+    refused before an unpayable noffer is built. ``ws://`` is accepted too
+    (local/regtest relays); anything else — wrong scheme, no host, bad port,
+    embedded whitespace — is rejected.
+    """
+    candidate = (url or "").strip()
+    if not candidate:
+        raise ValueError("relay URL is empty")
+    if any(c.isspace() for c in candidate):
+        raise ValueError(f"relay URL contains whitespace: {candidate!r}")
+    parts = urlsplit(candidate)
+    if parts.scheme not in ("ws", "wss"):
+        raise ValueError(
+            f"relay URL must start with wss:// or ws:// (got {candidate!r})")
+    if not parts.hostname:
+        raise ValueError(f"relay URL has no host: {candidate!r}")
+    try:
+        parts.port  # the property raises ValueError on a malformed port
+    except ValueError:
+        raise ValueError(f"relay URL has an invalid port: {candidate!r}")
+    return candidate
 
 
 class ProbeStatus(enum.Enum):

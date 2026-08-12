@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import secrets
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, MutableMapping, Optional
+from typing import Any, Dict, Iterable, List, MutableMapping, Optional
 
 from .noffer import OfferPriceType
 
@@ -36,6 +36,10 @@ class Offer:
     # issued invoice. Defaults to ``True`` so pre-existing offers keep honoring
     # memos (the behaviour before this flag existed).
     allow_payer_memo: bool = True
+    # Custom relay URL (``wss://…``) this offer's noffer advertises instead of
+    # the plugin's auto-probed pick. Empty means "automatic" (the behaviour
+    # before this field existed, and what stored pre-field offers load as).
+    relay: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -52,7 +56,33 @@ class Offer:
             active=d.get("active", True),
             created_at=d.get("created_at", 0),
             allow_payer_memo=d.get("allow_payer_memo", True),
+            relay=d.get("relay", ""),
         )
+
+
+def advertised_relay(offer: Optional[Offer], default_relay: str) -> str:
+    """The relay ``offer``'s noffer should advertise.
+
+    An offer's own custom relay wins; otherwise (no offer, or no override) the
+    plugin-wide auto-selected ``default_relay``.
+    """
+    if offer is not None and offer.relay.strip():
+        return offer.relay.strip()
+    return default_relay
+
+
+def listen_relays(offers: Iterable[Offer], default_relay: str) -> List[str]:
+    """Every relay the plugin must listen on so all ``offers`` stay payable.
+
+    The default relay first, then each distinct custom relay in offer order —
+    deduped, stripped, blanks dropped.
+    """
+    out: List[str] = []
+    for url in [default_relay, *(o.relay for o in offers)]:
+        url = (url or "").strip()
+        if url and url not in out:
+            out.append(url)
+    return out
 
 
 class OfferStore:
@@ -74,7 +104,8 @@ class OfferStore:
     def create(self, label: str = "",
                price_type: OfferPriceType = OfferPriceType.SPONTANEOUS,
                price: Optional[int] = None,
-               allow_payer_memo: bool = True) -> Offer:
+               allow_payer_memo: bool = True,
+               relay: str = "") -> Offer:
         offer = Offer(
             offer_id=_new_offer_id(),
             label=label,
@@ -82,6 +113,7 @@ class OfferStore:
             price=price,
             created_at=int(self._now_fn()),
             allow_payer_memo=allow_payer_memo,
+            relay=relay.strip(),
         )
         self._offers[offer.offer_id] = offer
         self._persist()
