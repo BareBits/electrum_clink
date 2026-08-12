@@ -15,10 +15,10 @@ from typing import TYPE_CHECKING, Optional, Tuple
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QFrame, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
-    QSlider, QSpinBox, QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-    QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QScrollArea, QSlider, QSpinBox, QTextEdit, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from electrum.i18n import _
@@ -31,6 +31,7 @@ from electrum.gui.common_qt.util import paintQR
 
 from . import protocol
 from .clink_plugin import ClinkPlugin
+from .relay_probe import normalize_relay_url
 from .selftest import CheckResult, CheckStatus
 
 # Dev-fee slider bounds (percent). The slider is log-scaled so the low end
@@ -73,7 +74,12 @@ COL_LABEL = 0
 COL_MEMO = 1
 COL_OFFER = 2
 COL_NOFFER = 3
-COL_STATUS = 4
+COL_RELAY = 4
+COL_STATUS = 5
+
+# First entry of the relay dropdown in the "New offer" dialog: use the
+# automatically probed relay rather than a fixed one.
+RELAY_AUTO_LABEL = _("Automatic (best probed relay)")
 
 # offer_id is stashed on the row (column 0) so label edits never lose the key.
 OFFER_ID_ROLE = Qt.ItemDataRole.UserRole
@@ -164,7 +170,7 @@ class ClinkTab(QWidget):
         root.addWidget(QLabel(_("Offers (double-click a label to rename):")))
         self.offers_list = QTreeWidget()
         self.offers_list.setHeaderLabels(
-            [_("Label"), _("Payer memo"), _("Offer id"), _("noffer"), _("Status")])
+            [_("Label"), _("Payer memo"), _("Offer id"), _("noffer"), _("Relay"), _("Status")])
         self.offers_list.setRootIsDecorated(False)
         self.offers_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         # We drive editing ourselves (only the label column, on double-click), so
@@ -172,6 +178,7 @@ class ClinkTab(QWidget):
         self.offers_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.offers_list.header().setSectionResizeMode(COL_NOFFER, QHeaderView.ResizeMode.Stretch)
         self.offers_list.header().setSectionResizeMode(COL_MEMO, QHeaderView.ResizeMode.ResizeToContents)
+        self.offers_list.header().setSectionResizeMode(COL_RELAY, QHeaderView.ResizeMode.ResizeToContents)
         self.offers_list.header().setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
         self.offers_list.itemSelectionChanged.connect(self._update_buttons)
         self.offers_list.itemDoubleClicked.connect(self._on_item_double_clicked)
@@ -322,13 +329,18 @@ class ClinkTab(QWidget):
         result = self._prompt_offer_details()
         if result is None:
             return
-        label, allow_memo = result
-        # create_offer probes for a payable relay (cached 24h), so run it in a
+        label, allow_memo, relay = result
+        # create_offer probes the relay (the auto pick is cached 24h; a custom
+        # one is always probed and a failure blocks creation), so run it in a
         # waiting dialog rather than freezing the tab.
+        message = (_("Checking that the chosen relay can carry this offer…")
+                   if relay else
+                   _("Checking that a Nostr relay can carry this offer…"))
         try:
             info = self.window.run_coroutine_dialog(
-                self.plugin.create_offer(label=label, allow_payer_memo=allow_memo),
-                _("Checking that a Nostr relay can carry this offer…"),
+                self.plugin.create_offer(
+                    label=label, allow_payer_memo=allow_memo, relay=relay),
+                message,
             )
         except UserCancelled:
             return
@@ -339,8 +351,13 @@ class ClinkTab(QWidget):
             self.window.show_warning(info["warning"], title=_("Offer may not be payable"))
         self._refresh()
 
-    def _prompt_offer_details(self) -> Optional[tuple[str, bool]]:
-        """Ask for a new offer's label and memo policy. Returns ``None`` if cancelled."""
+    def _prompt_offer_details(self) -> Optional[Tuple[str, bool, str]]:
+        """Ask for a new offer's label, memo policy and relay.
+
+        Returns ``(label, allow_payer_memo, relay)`` — ``relay`` is ``""`` for
+        automatic selection — or ``None`` if cancelled. A malformed typed relay
+        re-opens the dialog (with the input preserved) instead of accepting.
+        """
         d = WindowModalDialog(self.window, _("New CLINK offer"))
         vbox = QVBoxLayout(d)
         vbox.addWidget(QLabel(_("Label (optional):")))
@@ -353,11 +370,35 @@ class ClinkTab(QWidget):
             "When enabled, a note sent by the payer is folded into the invoice "
             "memo. When disabled, the invoice always uses this offer's label."))
         vbox.addWidget(memo_cb)
+        vbox.addWidget(QLabel(_("Relay:")))
+        relay_combo = QComboBox()
+        relay_combo.setEditable(True)
+        relay_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        relay_combo.addItem(RELAY_AUTO_LABEL)
+        for url in self.plugin.candidate_relay_urls():
+            relay_combo.addItem(url)
+        relay_combo.setToolTip(_(
+            "The Nostr relay this offer's noffer advertises. Keep \"{}\" to let "
+            "the plugin pick a working relay, choose one from the list, or type "
+            "your own in the form wss://myrelay.com:port. A custom relay is "
+            "tested first; the offer is only created if the test passes."
+            ).format(RELAY_AUTO_LABEL))
+        vbox.addWidget(relay_combo)
         vbox.addLayout(Buttons(CancelButton(d), OkButton(d)))
         label_edit.setFocus()
-        if not d.exec():
-            return None
-        return label_edit.text().strip(), memo_cb.isChecked()
+        while True:
+            if not d.exec():
+                return None
+            relay_text = relay_combo.currentText().strip()
+            if not relay_text or relay_text == RELAY_AUTO_LABEL:
+                relay = ""
+            else:
+                try:
+                    relay = normalize_relay_url(relay_text)
+                except ValueError as e:
+                    self.window.show_error(_("Invalid relay URL: {}").format(e))
+                    continue
+            return label_edit.text().strip(), memo_cb.isChecked(), relay
 
     def _on_remove(self) -> None:
         offer_id = self._selected_offer_id()
@@ -505,8 +546,15 @@ class ClinkTab(QWidget):
         try:
             self.offers_list.clear()
             for offer_id, info in self.plugin.list_offers().items():
-                item = QTreeWidgetItem([info["label"], "", offer_id, info["noffer"], ""])
+                item = QTreeWidgetItem(
+                    [info["label"], "", offer_id, info["noffer"],
+                     info.get("relay", ""), ""])
                 item.setData(COL_LABEL, OFFER_ID_ROLE, offer_id)
+                item.setToolTip(COL_RELAY, _(
+                    "Relay this noffer advertises — chosen by this offer."
+                    ) if info.get("relay_custom") else _(
+                    "Relay this noffer advertises — selected automatically "
+                    "(re-probed every 24h)."))
                 item.setFlags(item.flags()
                               | Qt.ItemFlag.ItemIsEditable
                               | Qt.ItemFlag.ItemIsUserCheckable)

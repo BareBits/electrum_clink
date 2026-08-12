@@ -14,7 +14,7 @@ import json
 import ssl
 import time
 from collections import OrderedDict, deque
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 import electrum_aionostr as aionostr
 from electrum_aionostr.event import Event as nEvent
@@ -35,6 +35,7 @@ from electrum.lnurl import (
 from electrum.util import (
     EventListener,
     OldTaskGroup,
+    UserFacingException,
     ca_path,
     event_listener,
     get_asyncio_loop,
@@ -47,11 +48,12 @@ from . import nip44, protocol
 from .devfee import MIN_PAYOUT_SAT, DevFeeLedger
 from .liquidity import LiquidityReserver, receivable_capacity_sat
 from .noffer import Noffer, OfferPriceType, noffer_encode
-from .offers import OfferStore
+from .offers import Offer, OfferStore, advertised_relay, listen_relays
 from .receipts import RETRY_INTERVAL_SEC, ReceiptRegistry, ReceiptTarget
 from .relay_probe import (
     ProbeResult,
     RelaySelection,
+    normalize_relay_url,
     probe_relay_payable,
     select_payable_relay,
 )
@@ -85,6 +87,9 @@ class ClinkServer(Logger, EventListener):
         self.plugin = plugin
         self.do_stop = False
         self.manager: Optional[aionostr.Manager] = None
+        # The relay set the current manager was built with; compared against
+        # listen_relay_urls() to detect when it must be rebuilt.
+        self._manager_relays: Set[str] = set()
         self.taskgroup: Optional[OldTaskGroup] = None
         self.ssl_context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH, cafile=ca_path)
         self._seen_events: "OrderedDict[str, None]" = OrderedDict()
@@ -168,14 +173,30 @@ class ClinkServer(Logger, EventListener):
     def invoice_expiry_sec(self) -> int:
         return int(self.config.CLINK_INVOICE_EXPIRY)  # type: ignore[attr-defined]
 
+    def offer_relay(self, offer: Optional[Offer]) -> str:
+        """The relay ``offer``'s noffer advertises (custom override or auto pick)."""
+        return advertised_relay(offer, self.effective_relay)
+
+    def listen_relay_urls(self) -> List[str]:
+        """Every relay the listener must sit on: the auto-selected relay plus
+        each distinct custom relay stored on an offer — an offer is payable only
+        if we are subscribed on the relay its noffer advertises."""
+        return listen_relays(self.offers.list(), self.effective_relay)
+
     def make_noffer(self, offer_id: str) -> str:
         """Build the noffer string a payer scans for ``offer_id``."""
         return noffer_encode(Noffer(
             pubkey=self.pubkey_hex,
-            relay=self.effective_relay,
+            relay=self.offer_relay(self.offers.get(offer_id)),
             offer=offer_id,
             price_type=OfferPriceType.SPONTANEOUS,
         ))
+
+    async def probe_custom_relay(self, relay: str) -> ProbeResult:
+        """Payability-probe a single user-chosen relay (same round-trip check
+        the automatic selection uses)."""
+        return await probe_relay_payable(
+            relay, ssl_context=self.ssl_context, proxy_factory=self._proxy_factory())
 
     def _proxy_factory(self) -> Optional[Callable[[], Any]]:
         """A factory that mints a fresh aiohttp proxy connector, or None.
@@ -315,8 +336,10 @@ class ClinkServer(Logger, EventListener):
         assert get_asyncio_loop() == get_running_loop(), "ClinkServer must run in the aio event loop"
         nostr_logger = self.logger.getChild("aionostr")
         factory = self._proxy_factory()
+        relays = self.listen_relay_urls()
+        self._manager_relays = set(relays)
         return aionostr.Manager(
-            relays=[self.effective_relay],
+            relays=relays,
             private_key=self.private_key.hex(),
             log=nostr_logger,
             ssl_context=self.ssl_context,
@@ -356,6 +379,12 @@ class ClinkServer(Logger, EventListener):
                 self.taskgroup = None
 
     async def refresh_manager(self) -> bool:
+        # Rebuild the manager whenever the desired relay set drifted from the
+        # one it was built with (relay re-pick, or an offer added/removed a
+        # custom relay) — a live manager never re-reads its relay list.
+        if self.manager is not None and self._manager_relays != set(self.listen_relay_urls()):
+            await self.manager.close()
+            self.manager = None
         if self.manager is None:
             self.manager = self.get_relay_manager()
         if len(self.manager.relays) <= 0:
@@ -381,7 +410,7 @@ class ClinkServer(Logger, EventListener):
             "since": int(time.time()),
             "limit": 0,
         }
-        self.logger.info(f"listening for offers on {self.effective_relay} as {self.pubkey_hex}")
+        self.logger.info(f"listening for offers on {', '.join(self.listen_relay_urls())} as {self.pubkey_hex}")
         async for event in self.manager.get_events(query, single_event=False, only_stored=False):
             try:
                 await self._dispatch(event)
@@ -727,8 +756,17 @@ class ClinkPlugin(BasePlugin):
 
     # --- API used by cmdline + Qt ----------------------------------------
 
-    async def create_offer(self, label: str = "", allow_payer_memo: bool = True) -> Dict[str, Any]:
+    async def create_offer(self, label: str = "", allow_payer_memo: bool = True,
+                           relay: str = "") -> Dict[str, Any]:
+        """Create an offer; ``relay`` (``wss://…``) pins a custom relay instead
+        of the automatic pick. A custom relay is payability-probed first and a
+        failure *blocks* creation (the user chose it explicitly, so a dead or
+        refusing relay is surfaced as an error, not a warning)."""
         assert self.server is not None, "wallet not loaded yet"
+        custom_relay = (relay or "").strip()
+        if custom_relay:
+            return await self._create_offer_custom_relay(
+                custom_relay, label=label, allow_payer_memo=allow_payer_memo)
         # Probe (cached 24h) before building the noffer so its single embedded
         # relay is one a payer can actually reach — see clink.relay_probe.
         selection = await self.server.pick_payable_relay()
@@ -748,6 +786,31 @@ class ClinkPlugin(BasePlugin):
                 "CLINK settings and create the offer again.")
         return result
 
+    async def _create_offer_custom_relay(self, relay: str, *, label: str,
+                                         allow_payer_memo: bool) -> Dict[str, Any]:
+        assert self.server is not None
+        relay = normalize_relay_url(relay)  # ValueError on a malformed URL
+        probe = await self.server.probe_custom_relay(relay)
+        if not probe.ok:
+            detail = f": {probe.detail}" if probe.detail else ""
+            raise UserFacingException(
+                f"Relay {relay} failed the payability check "
+                f"({probe.status.value}{detail}). The offer was not created.")
+        # The listener must sit on this relay too, or requests for the offer
+        # would never arrive; restart it only when the relay is actually new.
+        needs_listener = relay not in self.server.listen_relay_urls()
+        offer = self.server.offers.create(
+            label=label, allow_payer_memo=allow_payer_memo, relay=relay)
+        if needs_listener:
+            self.server.restart_event_handler()
+        return {
+            "offer_id": offer.offer_id, "label": offer.label,
+            "allow_payer_memo": offer.allow_payer_memo,
+            "noffer": self.server.make_noffer(offer.offer_id),
+            "relay": relay,
+            "relay_payable": True,
+        }
+
     def list_offers(self) -> Dict[str, Any]:
         # Read-only status getters tolerate a missing server (wallet not yet
         # loaded, or torn down on shutdown while the Qt poller is still firing).
@@ -755,8 +818,16 @@ class ClinkPlugin(BasePlugin):
             return {}
         return {o.offer_id: {"label": o.label, "active": o.active,
                              "allow_payer_memo": o.allow_payer_memo,
-                             "noffer": self.server.make_noffer(o.offer_id)}
+                             "noffer": self.server.make_noffer(o.offer_id),
+                             "relay": self.server.offer_relay(o),
+                             "relay_custom": bool(o.relay)}
                 for o in self.server.offers.list()}
+
+    def candidate_relay_urls(self) -> List[str]:
+        """Relays offered in the Qt "New offer" relay dropdown (config order)."""
+        if self.server is None:
+            return []
+        return self.server.candidate_relays()
 
     def set_offer_label(self, offer_id: str, label: str) -> bool:
         assert self.server is not None, "wallet not loaded yet"
@@ -768,7 +839,12 @@ class ClinkPlugin(BasePlugin):
 
     def remove_offer(self, offer_id: str) -> bool:
         assert self.server is not None, "wallet not loaded yet"
-        return self.server.offers.remove(offer_id)
+        before = set(self.server.listen_relay_urls())
+        removed = self.server.offers.remove(offer_id)
+        # Drop the listener connection to a custom relay no other offer needs.
+        if removed and set(self.server.listen_relay_urls()) != before:
+            self.server.restart_event_handler()
+        return removed
 
     async def check_noffers(self, offer_id: Optional[str] = None) -> Dict[str, Any]:
         """Self-test the noffer of one offer (or all offers) end to end.

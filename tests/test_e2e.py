@@ -20,10 +20,11 @@ import asyncio
 import json
 import os
 import signal
+import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterator
 
 import pytest
 
@@ -288,6 +289,118 @@ def test_check_noffers_round_trips_and_leaves_no_trace(rig) -> None:
         "clink_check_noffers", "--offer_id", first["offer_id"]))
     assert list(single) == [first["offer_id"]]
     assert single[first["offer_id"]]["ok"] is True
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _wait_available_sat(minimum: int, timeout: float = 150.0) -> int:
+    """Wait for reservations from earlier tests to expire and free liquidity."""
+    deadline = time.monotonic() + timeout
+    while _available_sat() < minimum and time.monotonic() < deadline:
+        time.sleep(3)
+    available = _available_sat()
+    assert available >= minimum, f"inbound liquidity did not free up ({available} sat)"
+    return available
+
+
+@pytest.fixture()
+def second_relay(rig) -> Iterator[str]:
+    """A *second* in-rig Nostr relay on its own port.
+
+    The rig's primary relay is injected as CLINK_RELAY, so a custom relay that
+    differs from it is exactly what exercises the multi-relay listener union.
+    """
+    port = _free_port()
+    proc = subprocess.Popen(
+        [str(RIG_PYTHON), "-m", "rig.relay", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=str(RIG_DIR),
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError("second relay exited during startup")
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    break
+            except OSError:
+                time.sleep(0.5)
+        else:
+            raise TimeoutError("second relay did not start listening")
+        yield f"ws://127.0.0.1:{port}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_custom_relay_offer_round_trips(rig, second_relay) -> None:
+    """An offer pinned to a user-chosen relay (the "type your own wss://…" path)
+    must advertise that relay in its noffer, survive the payability probe, show
+    up in list_offers with the custom relay — and actually be payable through
+    it, which proves the listener joined the second relay alongside the rig's
+    primary one."""
+    from clink.noffer import noffer_decode
+
+    created = json.loads(_electrum_cli(
+        "clink_add_offer", "--label", "custom-relay-e2e", "--relay", second_relay))
+    assert created["relay"] == second_relay, created
+    assert created["relay_payable"] is True, created
+    assert noffer_decode(created["noffer"]).relay == second_relay
+
+    listed = json.loads(_electrum_cli("clink_list_offers"))[created["offer_id"]]
+    assert listed["relay"] == second_relay
+    assert listed["relay_custom"] is True
+    assert listed["noffer"] == created["noffer"]
+
+    # Creating the offer restarts the listener so it also sits on the custom
+    # relay; the self-test round-trips through exactly that relay, so poll it
+    # until the reconnect settles.
+    _wait_available_sat(1)
+    deadline = time.monotonic() + 60
+    result: Dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        result = json.loads(_electrum_cli(
+            "clink_check_noffers", "--offer_id", created["offer_id"]))[created["offer_id"]]
+        if result["ok"]:
+            break
+        time.sleep(3)
+    assert result.get("ok") is True, f"offer never became payable on its custom relay: {result}"
+
+    # And a real payer (which connects only to the noffer's relay) gets an invoice.
+    available = _available_sat()
+    amount = max(1, min(1000, available // 2))
+    resp = asyncio.run(request_invoice(created["noffer"], amount_sats=amount, timeout=30))
+    assert "bolt11" in resp, resp
+
+    # An auto-relay offer created afterwards still uses the rig's primary relay.
+    auto = json.loads(_electrum_cli("clink_add_offer", "--label", "auto-after-custom"))
+    assert noffer_decode(auto["noffer"]).relay != second_relay
+
+
+def test_unreachable_custom_relay_blocks_creation(rig) -> None:
+    """A custom relay that fails the payability probe must block creation
+    (unlike the automatic path, which creates the offer with a warning)."""
+    before = json.loads(_electrum_cli("clink_list_offers"))
+    with pytest.raises(RuntimeError, match="payability"):
+        _electrum_cli("clink_add_offer", "--label", "bad-relay-e2e",
+                      "--relay", "ws://127.0.0.1:1")
+    after = json.loads(_electrum_cli("clink_list_offers"))
+    assert after.keys() == before.keys(), "a failing custom relay still created an offer"
+
+
+def test_malformed_custom_relay_is_rejected(rig) -> None:
+    before = json.loads(_electrum_cli("clink_list_offers"))
+    with pytest.raises(RuntimeError, match="wss://"):
+        _electrum_cli("clink_add_offer", "--relay", "https://not-a-websocket.example")
+    after = json.loads(_electrum_cli("clink_list_offers"))
+    assert after.keys() == before.keys()
 
 
 def test_devfee_accrues_and_pays_out(rig) -> None:

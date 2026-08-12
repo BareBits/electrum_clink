@@ -114,14 +114,15 @@ SimpleConfig.CLINK_DEVFEE_NOTICE_SHOWN = ConfigVar(
 
 @plugin_command("", plugin_name)
 async def add_offer(self: "Commands", label: str = "", allow_payer_memo: bool = True,
-                    plugin: "ClinkPlugin" = None) -> dict:
+                    relay: str = "", plugin: "ClinkPlugin" = None) -> dict:
     """
     Create a new spontaneous offer and return its noffer string.
 
     arg:str:label:optional human label for the offer
     arg:bool:allow_payer_memo:whether a payer's requested memo is folded into the invoice (default true)
+    arg:str:relay:custom relay URL (wss://myrelay.com:port) the noffer advertises; omit for automatic selection. Probed first — a failing relay blocks creation.
     """
-    return await plugin.create_offer(label, allow_payer_memo)
+    return await plugin.create_offer(label, allow_payer_memo, relay)
 
 
 @plugin_command("", plugin_name)

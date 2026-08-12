@@ -18,13 +18,46 @@ from __future__ import annotations
 import asyncio
 from typing import List, Optional
 
+import pytest
+
 from clink.relay_probe import (
     PROBE_CONTENT_PREFIX,
     ProbeResult,
     ProbeStatus,
     _run_probe,
+    normalize_relay_url,
     select_payable_relay,
 )
+
+
+# --- normalize_relay_url: user-supplied relay validation ------------------
+
+@pytest.mark.parametrize("url", [
+    "wss://myrelay.com:7777",
+    "wss://myrelay.com",
+    "ws://127.0.0.1:8088",          # plain ws for local/regtest relays
+    "wss://relay.example.org/nostr",
+])
+def test_normalize_relay_url_accepts_wellformed(url: str) -> None:
+    assert normalize_relay_url(url) == url
+
+
+def test_normalize_relay_url_strips_whitespace() -> None:
+    assert normalize_relay_url("  wss://myrelay.com:7777 \n") == "wss://myrelay.com:7777"
+
+
+@pytest.mark.parametrize("url", [
+    "",
+    "   ",
+    "myrelay.com",                  # no scheme
+    "https://myrelay.com",          # wrong scheme
+    "wss://",                       # no host
+    "wss://myrelay.com:notaport",   # malformed port
+    "wss://my relay.com:7777",      # embedded whitespace
+])
+def test_normalize_relay_url_rejects_malformed(url: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_relay_url(url)
 
 
 # --- select_payable_relay: ordering + fallback policy --------------------
