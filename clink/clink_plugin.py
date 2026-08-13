@@ -175,8 +175,10 @@ class ClinkServer(Logger, EventListener):
 
     @property
     def effective_relay(self) -> str:
-        """The relay to advertise/listen on: the probed pick while it is fresh,
-        otherwise the raw first choice."""
+        """The plugin-wide default relay: the probed pick while it is fresh,
+        otherwise the raw first choice. Only new offers (at creation) and
+        pre-pinning legacy offers derive their relay from this — a created
+        offer carries its own pinned relay."""
         sel = self._relay_selection
         if sel and sel.relay and (time.time() - self._relay_selection_at) < RELAY_CACHE_TTL_SEC:
             return sel.relay
@@ -187,13 +189,15 @@ class ClinkServer(Logger, EventListener):
         return int(self.config.CLINK_INVOICE_EXPIRY)  # type: ignore[attr-defined]
 
     def offer_relay(self, offer: Optional[Offer]) -> str:
-        """The relay ``offer``'s noffer advertises (custom override or auto pick)."""
+        """The relay ``offer``'s noffer advertises (its pinned relay, or the
+        plugin-wide default for a pre-pinning legacy offer)."""
         return advertised_relay(offer, self.effective_relay)
 
     def listen_relay_urls(self) -> List[str]:
-        """Every relay the listener must sit on: the auto-selected relay plus
-        each distinct custom relay stored on an offer — an offer is payable only
-        if we are subscribed on the relay its noffer advertises."""
+        """Every relay the listener must sit on: each offer's pinned relay,
+        plus the plugin-wide default while any offer still needs it — an offer
+        is payable only if we are subscribed on the relay its noffer
+        advertises."""
         return listen_relays(self.offers.list(), self.effective_relay)
 
     def advertised_relay_urls(self) -> List[str]:
@@ -264,6 +268,8 @@ class ClinkServer(Logger, EventListener):
             cached = self._relay_selection
             if (not force and cached is not None
                     and (now - self._relay_selection_at) < RELAY_CACHE_TTL_SEC):
+                if self._pin_legacy_offer_relays(cached):
+                    self.restart_event_handler()
                 return cached
 
             factory = self._proxy_factory()
@@ -281,10 +287,46 @@ class ClinkServer(Logger, EventListener):
                     "No configured Nostr relay accepted a CLINK test request; "
                     "offers may be unpayable. Tried: "
                     + ", ".join(r.relay for r in sel.results))
-            if sel.relay and sel.relay != prev_relay:
+            restart = bool(sel.relay) and sel.relay != prev_relay
+            if restart:
                 self.logger.info(f"CLINK relay selected: {sel.relay}")
+            if self._pin_legacy_offer_relays(sel) or restart:
                 self.restart_event_handler()
             return sel
+
+    def _pin_legacy_offer_relays(self, sel: RelaySelection) -> bool:
+        """Migrate pre-pinning offers onto the probed relay ``sel``.
+
+        Offers stored before relays were pinned at creation have an empty
+        ``relay`` and used to silently re-derive it (and thus a *different*
+        noffer) from the config order after every restart. The first payability
+        probe that succeeds writes its pick onto them, making their noffers
+        stable from then on. Returns whether anything was pinned (the listener
+        set changed).
+        """
+        if not sel.ok:
+            return False
+        pinned = self.offers.pin_missing_relays(sel.relay)
+        if pinned:
+            self.logger.info(
+                f"pinned relay {sel.relay} on {len(pinned)} pre-existing "
+                f"offer(s): {', '.join(pinned)}")
+        return bool(pinned)
+
+    async def ensure_offer_relays_pinned(self) -> None:
+        """Run a relay pick when a pre-pinning offer still lacks its relay.
+
+        Called from :meth:`run` before the listener manager is (re)built, so a
+        legacy offer is migrated onto a probed relay — and the listener covers
+        it — as soon as the plugin comes up, not only when the user happens to
+        create another offer. A no-op once every offer carries a pinned relay.
+        """
+        if all((o.relay or "").strip() for o in self.offers.list()):
+            return
+        try:
+            await self.pick_payable_relay()
+        except Exception:
+            self.logger.exception("could not pin a relay on legacy offers")
 
     # --- noffer self-test ("Check noffers") --------------------------------
 
@@ -398,6 +440,7 @@ class ClinkServer(Logger, EventListener):
                 if self.do_stop:
                     return
                 await asyncio.sleep(5)
+            await self.ensure_offer_relays_pinned()
             if not await self.refresh_manager():
                 await asyncio.sleep(30)
                 continue
@@ -860,9 +903,10 @@ class ClinkPlugin(BasePlugin):
     async def create_offer(self, label: str = "", allow_payer_memo: bool = True,
                            relay: str = "") -> Dict[str, Any]:
         """Create an offer; ``relay`` (``wss://…``) pins a custom relay instead
-        of the automatic pick. A custom relay is payability-probed first and a
-        failure *blocks* creation (the user chose it explicitly, so a dead or
-        refusing relay is surfaced as an error, not a warning)."""
+        of the automatic pick. Either way the relay is payability-probed first
+        and a failing probe *blocks* creation, and the chosen relay is pinned
+        onto the offer so the noffer handed to payers never changes across
+        restarts."""
         assert self.server is not None, "wallet not loaded yet"
         custom_relay = (relay or "").strip()
         if custom_relay:
@@ -871,21 +915,28 @@ class ClinkPlugin(BasePlugin):
         # Probe (cached 24h) before building the noffer so its single embedded
         # relay is one a payer can actually reach — see clink.relay_probe.
         selection = await self.server.pick_payable_relay()
-        offer = self.server.offers.create(label=label, allow_payer_memo=allow_payer_memo)
-        result: Dict[str, Any] = {
+        if not selection.ok or not selection.relay:
+            tried = ", ".join(r.relay for r in selection.results) or "(none configured)"
+            raise UserFacingException(
+                "No Nostr relay accepted a test payment request, so the offer "
+                f"would not be payable and was not created. Tried: {tried}. "
+                "Set a working relay in the CLINK settings and try again.")
+        # The listener must sit on the pinned relay too; usually it already
+        # does (pick_payable_relay restarts it on a changed pick), but a relay
+        # re-picked from the 24h cache may not be covered yet.
+        needs_listener = selection.relay not in self.server.listen_relay_urls()
+        offer = self.server.offers.create(
+            label=label, allow_payer_memo=allow_payer_memo,
+            relay=selection.relay, relay_custom=False)
+        if needs_listener:
+            self.server.restart_event_handler()
+        return {
             "offer_id": offer.offer_id, "label": offer.label,
             "allow_payer_memo": offer.allow_payer_memo,
             "noffer": self.server.make_noffer(offer.offer_id),
-            "relay": selection.relay,
-            "relay_payable": selection.ok,
+            "relay": offer.relay,
+            "relay_payable": True,
         }
-        if not selection.ok:
-            tried = ", ".join(r.relay for r in selection.results) or "(none configured)"
-            result["warning"] = (
-                "No Nostr relay accepted a test payment request, so this offer "
-                f"may not be payable. Tried: {tried}. Set a working relay in the "
-                "CLINK settings and create the offer again.")
-        return result
 
     async def _create_offer_custom_relay(self, relay: str, *, label: str,
                                          allow_payer_memo: bool) -> Dict[str, Any]:
@@ -901,7 +952,8 @@ class ClinkPlugin(BasePlugin):
         # would never arrive; restart it only when the relay is actually new.
         needs_listener = relay not in self.server.listen_relay_urls()
         offer = self.server.offers.create(
-            label=label, allow_payer_memo=allow_payer_memo, relay=relay)
+            label=label, allow_payer_memo=allow_payer_memo, relay=relay,
+            relay_custom=True)
         if needs_listener:
             self.server.restart_event_handler()
         return {
@@ -921,7 +973,10 @@ class ClinkPlugin(BasePlugin):
                              "allow_payer_memo": o.allow_payer_memo,
                              "noffer": self.server.make_noffer(o.offer_id),
                              "relay": self.server.offer_relay(o),
-                             "relay_custom": bool(o.relay)}
+                             "relay_custom": o.relay_custom,
+                             # False only for a pre-pinning legacy offer whose
+                             # relay is still re-derived from the config order.
+                             "relay_pinned": bool(o.relay.strip())}
                 for o in self.server.offers.list()}
 
     def candidate_relay_urls(self) -> List[str]:

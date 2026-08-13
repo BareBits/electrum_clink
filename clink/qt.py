@@ -343,14 +343,14 @@ class ClinkTab(QWidget):
         if result is None:
             return
         label, allow_memo, relay = result
-        # create_offer probes the relay (the auto pick is cached 24h; a custom
-        # one is always probed and a failure blocks creation), so run it in a
-        # waiting dialog rather than freezing the tab.
+        # create_offer probes the relay (the auto pick is cached 24h; a failing
+        # probe blocks creation for custom and automatic relays alike), so run
+        # it in a waiting dialog rather than freezing the tab.
         message = (_("Checking that the chosen relay can carry this offer…")
                    if relay else
                    _("Checking that a Nostr relay can carry this offer…"))
         try:
-            info = self.window.run_coroutine_dialog(
+            self.window.run_coroutine_dialog(
                 self.plugin.create_offer(
                     label=label, allow_payer_memo=allow_memo, relay=relay),
                 message,
@@ -360,8 +360,6 @@ class ClinkTab(QWidget):
         except Exception as e:
             self.window.show_error(_("Could not create offer: {}").format(e))
             return
-        if isinstance(info, dict) and info.get("warning"):
-            self.window.show_warning(info["warning"], title=_("Offer may not be payable"))
         self._refresh()
 
     def _prompt_offer_details(self) -> Optional[Tuple[str, bool, str]]:
@@ -391,10 +389,11 @@ class ClinkTab(QWidget):
         for url in self.plugin.candidate_relay_urls():
             relay_combo.addItem(url)
         relay_combo.setToolTip(_(
-            "The Nostr relay this offer's noffer advertises. Keep \"{}\" to let "
-            "the plugin pick a working relay, choose one from the list, or type "
-            "your own in the form wss://myrelay.com:port. A custom relay is "
-            "tested first; the offer is only created if the test passes."
+            "The Nostr relay this offer's noffer advertises, pinned to the "
+            "offer at creation. Keep \"{}\" to let the plugin pick a working "
+            "relay, choose one from the list, or type your own in the form "
+            "wss://myrelay.com:port. The relay is tested first; the offer is "
+            "only created if the test passes."
             ).format(RELAY_AUTO_LABEL))
         vbox.addWidget(relay_combo)
         vbox.addLayout(Buttons(CancelButton(d), OkButton(d)))
@@ -599,11 +598,19 @@ class ClinkTab(QWidget):
                     [info["label"], "", offer_id, info["noffer"],
                      info.get("relay", ""), ""])
                 item.setData(COL_LABEL, OFFER_ID_ROLE, offer_id)
-                relay_tooltip = _(
-                    "Relay this noffer advertises — chosen by this offer."
-                    ) if info.get("relay_custom") else _(
-                    "Relay this noffer advertises — selected automatically "
-                    "(re-probed every 24h).")
+                if info.get("relay_custom"):
+                    relay_tooltip = _(
+                        "Relay this noffer advertises — chosen for this offer.")
+                elif info.get("relay_pinned"):
+                    relay_tooltip = _(
+                        "Relay this noffer advertises — picked automatically "
+                        "when the offer was created and pinned to it, so the "
+                        "noffer never changes.")
+                else:
+                    relay_tooltip = _(
+                        "Relay this noffer advertises — not yet pinned (offer "
+                        "predates relay pinning); it is pinned automatically "
+                        "at the next successful relay probe.")
                 item.setToolTip(COL_RELAY, relay_tooltip)
                 item.setData(COL_RELAY, RELAY_BASE_TOOLTIP_ROLE, relay_tooltip)
                 item.setFlags(item.flags()

@@ -55,9 +55,10 @@ if TYPE_CHECKING:
 
 plugin_name = "clink"
 
-# Relay the plugin subscribes to and advertises in every noffer. Empty -> fall
-# back to Electrum's global NOSTR_RELAYS (first entry). The rig injects its local
-# relay here for development.
+# Relay the plugin prefers when picking (and pinning) the relay for a new
+# noffer, and subscribes to. Empty -> fall back to Electrum's global
+# NOSTR_RELAYS (first entry). The rig injects its local relay here for
+# development.
 SimpleConfig.CLINK_RELAY = ConfigVar(
     key="plugins.clink.relay",
     default="",
@@ -120,7 +121,7 @@ async def add_offer(self: "Commands", label: str = "", allow_payer_memo: bool = 
 
     arg:str:label:optional human label for the offer
     arg:bool:allow_payer_memo:whether a payer's requested memo is folded into the invoice (default true)
-    arg:str:relay:custom relay URL (wss://myrelay.com:port) the noffer advertises; omit for automatic selection. Probed first — a failing relay blocks creation.
+    arg:str:relay:custom relay URL (wss://myrelay.com:port) the noffer advertises; omit for automatic selection. Either way the relay is probed first (a failing probe blocks creation) and pinned to the offer, so its noffer never changes across restarts.
     """
     return await plugin.create_offer(label, allow_payer_memo, relay)
 
