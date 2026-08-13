@@ -169,6 +169,14 @@ def test_created_offer_reports_payable_relay(rig) -> None:
     result = asyncio.run(probe_relay_payable(decoded.relay, timeout=15))
     assert result.status is ProbeStatus.OK, result
 
+    # The auto pick is pinned onto the stored offer (not re-derived from
+    # config), so the noffer survives wallet restarts unchanged.
+    listed = json.loads(_electrum_cli("clink_list_offers"))[created["offer_id"]]
+    assert listed["relay"] == created["relay"], listed
+    assert listed["relay_pinned"] is True, listed
+    assert listed["relay_custom"] is False, listed
+    assert listed["noffer"] == created["noffer"], listed
+
 
 def test_issued_invoice_carries_requested_description(rig) -> None:
     """The plugin folds the payer's NIP-69 ``description`` into the bolt11 memo,
@@ -498,7 +506,7 @@ def test_relay_liveness_flags_dead_relay_and_prunes_after_removal(rig) -> None:
 
 def test_unreachable_custom_relay_blocks_creation(rig) -> None:
     """A custom relay that fails the payability probe must block creation
-    (unlike the automatic path, which creates the offer with a warning)."""
+    (the automatic path blocks the same way when no candidate passes)."""
     before = json.loads(_electrum_cli("clink_list_offers"))
     with pytest.raises(RuntimeError, match="payability"):
         _electrum_cli("clink_add_offer", "--label", "bad-relay-e2e",

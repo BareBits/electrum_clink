@@ -36,10 +36,15 @@ class Offer:
     # issued invoice. Defaults to ``True`` so pre-existing offers keep honoring
     # memos (the behaviour before this flag existed).
     allow_payer_memo: bool = True
-    # Custom relay URL (``wss://…``) this offer's noffer advertises instead of
-    # the plugin's auto-probed pick. Empty means "automatic" (the behaviour
-    # before this field existed, and what stored pre-field offers load as).
+    # Relay URL (``wss://…``) this offer's noffer advertises, pinned at
+    # creation (either the user's explicit choice or the auto-probed pick) so
+    # the noffer handed to payers never changes across restarts. Empty only on
+    # offers stored before pinning existed; those fall back to the plugin-wide
+    # relay until :meth:`OfferStore.pin_missing_relays` migrates them.
     relay: str = ""
+    # True when ``relay`` was chosen explicitly by the user rather than pinned
+    # from the automatic payability probe (display-only distinction).
+    relay_custom: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -57,14 +62,17 @@ class Offer:
             created_at=d.get("created_at", 0),
             allow_payer_memo=d.get("allow_payer_memo", True),
             relay=d.get("relay", ""),
+            # Offers stored before this flag existed could only carry a
+            # non-empty relay if the user chose it explicitly.
+            relay_custom=bool(d.get("relay_custom", bool(d.get("relay", "")))),
         )
 
 
 def advertised_relay(offer: Optional[Offer], default_relay: str) -> str:
     """The relay ``offer``'s noffer should advertise.
 
-    An offer's own custom relay wins; otherwise (no offer, or no override) the
-    plugin-wide auto-selected ``default_relay``.
+    An offer's own pinned relay wins; otherwise (no offer, or a pre-pinning
+    legacy offer) the plugin-wide auto-selected ``default_relay``.
     """
     if offer is not None and offer.relay.strip():
         return offer.relay.strip()
@@ -89,11 +97,19 @@ def advertised_relays(offers: Iterable[Offer], default_relay: str) -> List[str]:
 def listen_relays(offers: Iterable[Offer], default_relay: str) -> List[str]:
     """Every relay the plugin must listen on so all ``offers`` stay payable.
 
-    The default relay first, then each distinct custom relay in offer order —
-    deduped, stripped, blanks dropped.
+    Each offer's pinned relay in offer order — deduped, stripped, blanks
+    dropped. The plugin-wide default relay is prepended only while it is still
+    needed: when there are no offers yet (so the listener is up before the
+    first one is created) or while a pre-pinning legacy offer still falls back
+    to it.
     """
+    offer_list = list(offers)
+    urls: List[str] = []
+    if not offer_list or any(not (o.relay or "").strip() for o in offer_list):
+        urls.append(default_relay)
+    urls.extend(o.relay for o in offer_list)
     out: List[str] = []
-    for url in [default_relay, *(o.relay for o in offers)]:
+    for url in urls:
         url = (url or "").strip()
         if url and url not in out:
             out.append(url)
@@ -120,7 +136,8 @@ class OfferStore:
                price_type: OfferPriceType = OfferPriceType.SPONTANEOUS,
                price: Optional[int] = None,
                allow_payer_memo: bool = True,
-               relay: str = "") -> Offer:
+               relay: str = "",
+               relay_custom: bool = False) -> Offer:
         offer = Offer(
             offer_id=_new_offer_id(),
             label=label,
@@ -129,10 +146,31 @@ class OfferStore:
             created_at=int(self._now_fn()),
             allow_payer_memo=allow_payer_memo,
             relay=relay.strip(),
+            relay_custom=bool(relay_custom) and bool(relay.strip()),
         )
         self._offers[offer.offer_id] = offer
         self._persist()
         return offer
+
+    def pin_missing_relays(self, relay: str) -> List[str]:
+        """Pin ``relay`` on every offer that has none; return the ids changed.
+
+        One-time migration for offers stored before relays were pinned at
+        creation: the first successful payability probe writes its pick onto
+        them, so from then on their noffers survive restarts unchanged.
+        """
+        relay = (relay or "").strip()
+        if not relay:
+            return []
+        pinned: List[str] = []
+        for offer in self._offers.values():
+            if not offer.relay.strip():
+                offer.relay = relay
+                offer.relay_custom = False
+                pinned.append(offer.offer_id)
+        if pinned:
+            self._persist()
+        return pinned
 
     def get(self, offer_id: str) -> Optional[Offer]:
         return self._offers.get(offer_id)

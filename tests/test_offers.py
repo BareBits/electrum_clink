@@ -164,3 +164,71 @@ def test_advertised_relays_empty_without_offers() -> None:
 def test_advertised_relays_all_custom_skips_default() -> None:
     offers = [Offer(offer_id="a", relay="wss://mine.example")]
     assert advertised_relays(offers, "wss://auto.example") == ["wss://mine.example"]
+
+
+# --- pinned relays (auto pick stored on the offer at creation) ------------
+
+def test_create_pins_auto_relay_as_non_custom() -> None:
+    o = OfferStore({}).create(relay="wss://picked.example", relay_custom=False)
+    assert o.relay == "wss://picked.example"
+    assert o.relay_custom is False
+
+
+def test_create_marks_custom_relay() -> None:
+    o = OfferStore({}).create(relay="wss://mine.example", relay_custom=True)
+    assert o.relay_custom is True
+    # the flag is meaningless without a relay and must not stick
+    assert OfferStore({}).create(relay="", relay_custom=True).relay_custom is False
+
+
+def test_relay_custom_round_trips_through_dict() -> None:
+    for custom in (True, False):
+        o = Offer.from_dict(
+            Offer(offer_id="x", relay="wss://r.example", relay_custom=custom).to_dict())
+        assert o.relay_custom is custom
+
+
+def test_relay_custom_legacy_defaults() -> None:
+    # pre-flag stored offers: a non-empty relay could only be user-chosen
+    assert Offer.from_dict({"offer_id": "a"}).relay_custom is False
+    assert Offer.from_dict(
+        {"offer_id": "a", "relay": "wss://mine.example"}).relay_custom is True
+
+
+def test_pin_missing_relays_migrates_only_unpinned_offers() -> None:
+    storage: dict = {}
+    store = OfferStore(storage)
+    legacy_a = store.create()                                  # dynamic (legacy)
+    legacy_b = store.create()                                  # dynamic (legacy)
+    custom = store.create(relay="wss://mine.example", relay_custom=True)
+    pinned = store.pin_missing_relays("wss://picked.example")
+    assert sorted(pinned) == sorted([legacy_a.offer_id, legacy_b.offer_id])
+    reloaded = OfferStore(storage)  # the migration must persist
+    for oid in (legacy_a.offer_id, legacy_b.offer_id):
+        assert reloaded.get(oid).relay == "wss://picked.example"
+        assert reloaded.get(oid).relay_custom is False
+    assert reloaded.get(custom.offer_id).relay == "wss://mine.example"
+    assert reloaded.get(custom.offer_id).relay_custom is True
+    # second run: nothing left to migrate
+    assert store.pin_missing_relays("wss://other.example") == []
+
+
+def test_pin_missing_relays_ignores_blank_relay() -> None:
+    store = OfferStore({})
+    o = store.create()
+    assert store.pin_missing_relays("   ") == []
+    assert store.get(o.offer_id).relay == ""
+
+
+def test_listen_relays_skips_default_once_all_offers_pinned() -> None:
+    offers = [
+        Offer(offer_id="a", relay="wss://one.example"),
+        Offer(offer_id="b", relay="wss://two.example"),
+    ]
+    # every offer carries its own relay -> no reason to sit on the default too
+    assert listen_relays(offers, "wss://auto.example") == [
+        "wss://one.example", "wss://two.example"]
+    # ...but a still-unpinned legacy offer brings the default back
+    offers.append(Offer(offer_id="c"))
+    assert listen_relays(offers, "wss://auto.example") == [
+        "wss://auto.example", "wss://one.example", "wss://two.example"]

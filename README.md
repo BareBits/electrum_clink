@@ -27,14 +27,16 @@ An *optional* .1% dev fee is included by default, which can be disabled in the s
 * **Generate noffers.** Each offer is a *spontaneous* offer (the payer names the
   amount). The plugin derives a stable Nostr identity from the wallet's
   Lightning node key, so a wallet's noffers survive restarts.
-* **Payable-relay auto-pick.** A noffer embeds exactly one relay, and the
-  reference payer connects to *only* that relay — so a dead relay yields a noffer
-  that looks fine but is silently unpayable. When you create an offer (unless you
-  pin `plugins.clink.relay`), the plugin probes your configured relays with a
-  real kind-`21001` write/read-back round-trip and embeds the first one that
-  works, restarting its listener onto the same relay. The result is cached for
-  24h; if none pass, the offer is still created but flagged as possibly
-  unpayable. See `relay_probe.py`.
+* **Payable-relay auto-pick, pinned per offer.** A noffer embeds exactly one
+  relay, and the reference payer connects to *only* that relay — so a dead relay
+  yields a noffer that looks fine but is silently unpayable. When you create an
+  offer (unless you pin `plugins.clink.relay`), the plugin probes your configured
+  relays with a real kind-`21001` write/read-back round-trip, embeds the first
+  one that works, and **pins it onto the offer** — the noffer you hand out never
+  changes across restarts, and the listener always covers it. The probe result is
+  cached for 24h (it only affects which relay *new* offers get); if none pass,
+  offer creation is refused. Offers created by older versions are pinned
+  automatically at the next successful probe. See `relay_probe.py`.
 * **Answer requests.** It subscribes to its relay for kind-`21001` requests,
   NIP-44-decrypts them, and replies with a BOLT-11 invoice — or a structured
   error (NIP-69 codes) when it can't fulfil the request.
