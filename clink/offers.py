@@ -71,6 +71,21 @@ def advertised_relay(offer: Optional[Offer], default_relay: str) -> str:
     return default_relay
 
 
+def advertised_relays(offers: Iterable[Offer], default_relay: str) -> List[str]:
+    """Every distinct relay some existing offer's noffer advertises.
+
+    Unlike :func:`listen_relays` this is empty when there are no offers: with
+    nothing a payer could hold, there is no advertised relay to care about
+    (the liveness monitor probes exactly this list).
+    """
+    out: List[str] = []
+    for offer in offers:
+        url = advertised_relay(offer, default_relay).strip()
+        if url and url not in out:
+            out.append(url)
+    return out
+
+
 def listen_relays(offers: Iterable[Offer], default_relay: str) -> List[str]:
     """Every relay the plugin must listen on so all ``offers`` stay payable.
 

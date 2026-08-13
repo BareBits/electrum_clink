@@ -25,7 +25,8 @@ from electrum.i18n import _
 from electrum.plugin import hook
 from electrum.util import UserCancelled, get_asyncio_loop
 from electrum.gui.qt.util import (
-    Buttons, CancelButton, CloseButton, OkButton, WindowModalDialog, read_QIcon,
+    Buttons, CancelButton, CloseButton, ColorScheme, OkButton, WindowModalDialog,
+    read_QIcon,
 )
 from electrum.gui.common_qt.util import paintQR
 
@@ -83,6 +84,11 @@ RELAY_AUTO_LABEL = _("Automatic (best probed relay)")
 
 # offer_id is stashed on the row (column 0) so label edits never lose the key.
 OFFER_ID_ROLE = Qt.ItemDataRole.UserRole
+# Base (healthy-state) tooltip of the relay column, stashed on the row so the
+# liveness refresh can restore it once a flagged relay recovers.
+RELAY_BASE_TOOLTIP_ROLE = Qt.ItemDataRole.UserRole
+# Prefix marking a row whose advertised relay failed the last liveness check.
+RELAY_DOWN_PREFIX = "⚠ "
 
 # When the CLINK tab is first shown, grow the window *up to* this size so the
 # offers table is visible out of the box — never shrinking a larger window.
@@ -165,6 +171,13 @@ class ClinkTab(QWidget):
         self.expiry_spin.valueChanged.connect(self._on_expiry_changed)
         status_row.addWidget(self.expiry_spin)
         root.addLayout(status_row)
+
+        # Hidden while every advertised relay passes the hourly liveness check.
+        self.relay_health_label = QLabel()
+        self.relay_health_label.setWordWrap(True)
+        self.relay_health_label.setStyleSheet(ColorScheme.RED.as_stylesheet())
+        self.relay_health_label.setVisible(False)
+        root.addWidget(self.relay_health_label)
 
         # --- offers table ------------------------------------------------
         root.addWidget(QLabel(_("Offers (double-click a label to rename):")))
@@ -516,6 +529,42 @@ class ClinkTab(QWidget):
                 item.setText(COL_STATUS, text)
             item.setToolTip(COL_STATUS, tooltip)
 
+    def _refresh_relay_health(self) -> None:
+        """Surface relays that failed the hourly liveness check (retried once).
+
+        A banner lists every down relay; affected offer rows get a ⚠ marker on
+        the relay column. Both clear on their own once a relay recovers.
+        """
+        liveness = self.plugin.relay_liveness()
+        down = {url: res for url, res in liveness.items() if not res.get("ok")}
+        if down:
+            parts = []
+            for url, res in down.items():
+                when = datetime.fromtimestamp(res["checked_at"]).strftime("%H:%M")
+                parts.append(f"{url} ({res['status']}, {when})")
+            self.relay_health_label.setText(RELAY_DOWN_PREFIX + _(
+                "Relay failing the periodic liveness check (retried once): {} — "
+                "offers advertising it may currently be unpayable. Consider "
+                "moving affected offers to a working relay."
+                ).format("; ".join(parts)))
+        self.relay_health_label.setVisible(bool(down))
+
+        for i in range(self.offers_list.topLevelItemCount()):
+            item = self.offers_list.topLevelItem(i)
+            relay = item.text(COL_RELAY).removeprefix(RELAY_DOWN_PREFIX)
+            base_tooltip = item.data(COL_RELAY, RELAY_BASE_TOOLTIP_ROLE) or ""
+            if relay in down:
+                text = RELAY_DOWN_PREFIX + relay
+                tooltip = base_tooltip + "\n" + _(
+                    "This relay failed the last liveness check ({}); payers "
+                    "may not reach this offer through it."
+                    ).format(down[relay]["status"])
+            else:
+                text, tooltip = relay, base_tooltip
+            if item.text(COL_RELAY) != text:
+                item.setText(COL_RELAY, text)
+            item.setToolTip(COL_RELAY, tooltip)
+
     def _on_show_qr(self) -> None:
         noffer = self._selected_noffer()
         if not noffer:
@@ -550,11 +599,13 @@ class ClinkTab(QWidget):
                     [info["label"], "", offer_id, info["noffer"],
                      info.get("relay", ""), ""])
                 item.setData(COL_LABEL, OFFER_ID_ROLE, offer_id)
-                item.setToolTip(COL_RELAY, _(
+                relay_tooltip = _(
                     "Relay this noffer advertises — chosen by this offer."
                     ) if info.get("relay_custom") else _(
                     "Relay this noffer advertises — selected automatically "
-                    "(re-probed every 24h)."))
+                    "(re-probed every 24h).")
+                item.setToolTip(COL_RELAY, relay_tooltip)
+                item.setData(COL_RELAY, RELAY_BASE_TOOLTIP_ROLE, relay_tooltip)
                 item.setFlags(item.flags()
                               | Qt.ItemFlag.ItemIsEditable
                               | Qt.ItemFlag.ItemIsUserCheckable)
@@ -599,3 +650,4 @@ class ClinkTab(QWidget):
             devfee["owed_sat"], devfee["destination"] or "—"))
 
         self._refresh_check_column()
+        self._refresh_relay_health()

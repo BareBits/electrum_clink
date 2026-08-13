@@ -61,6 +61,15 @@ An *optional* .1% dev fee is included by default, which can be disabled in the s
   timestamped). The self-test invoice is unwound immediately: no liquidity is
   held, no wallet request, receipt, or dev-fee entry is left behind. See
   `selftest.py`.
+* **Hourly relay liveness check.** A distributed noffer embeds one relay; if
+  that relay later dies, the offer silently stops being payable. Every hour (on
+  the receipt-retry tick, and once per reconnect) the plugin re-runs the
+  payability probe against each relay an existing offer advertises. A failure
+  is re-probed once (after 60 s) before being flagged, so a transient blip never
+  raises an alarm; a confirmed-down relay is surfaced as a warning banner in the
+  CLINK tab (with a ⚠ marker on affected offers) and a log warning — the relay
+  selection is never changed behind your back. On demand: `clink_check_relays`.
+  See `liveness.py`.
 * **Debits / management** (`ndebit` / `nmanage`) are **not** implemented yet;
   they are stubbed via the protocol's "unsupported feature" path so they can be
   added without restructuring.
@@ -74,6 +83,7 @@ clink/                 # the importable plugin package (this is what ships)
   clink_plugin.py      # runtime: relay loop + request handler + liquidity lock
   noffer.py            # noffer bech32/TLV codec (byte-identical to @shocknet/clink-sdk)
   relay_probe.py       # payability probe: pick a relay a payer can actually reach
+  liveness.py          # hourly re-probe of every relay an existing noffer advertises
   selftest.py          # noffer round-trip self-test ("Check noffers")
   nip44.py             # NIP-44 v2 (validated against the official vectors)
   liquidity.py         # inbound-liquidity reservation
@@ -122,6 +132,7 @@ electrum clink_set_offer_payer_memo <offer_id> false      # allow/disallow payer
 electrum clink_remove_offer <offer_id>
 electrum clink_check_noffers                # self-test every noffer end to end
 electrum clink_check_noffers --offer_id <offer_id>  # ...or just one
+electrum clink_check_relays                 # probe every relay your noffers advertise (runs hourly on its own)
 electrum clink_clink_status                 # available / reserved liquidity
 electrum clink_devfee_status                # dev-fee settings + owed balance
 electrum clink_devfee_pay                   # force a payout now (testing)
