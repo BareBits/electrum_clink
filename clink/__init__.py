@@ -180,6 +180,19 @@ async def check_noffers(self: "Commands", offer_id: str = "",
 
 
 @plugin_command("", plugin_name)
+async def check_relays(self: "Commands", retry_delay: int = -1,
+                       plugin: "ClinkPlugin" = None) -> dict:
+    """
+    Probe every relay an existing offer's noffer advertises and report whether
+    each can still carry a payment round-trip. The same check runs hourly on its
+    own; a failing relay is re-probed once before being reported down. Returns
+    {relay_url: result}.
+    arg:int:retry_delay:seconds to wait before the confirming re-probe of a failed relay (omit for the default 60)
+    """
+    return await plugin.check_relays(retry_delay if retry_delay >= 0 else None)
+
+
+@plugin_command("", plugin_name)
 async def clink_status(self: "Commands", plugin: "ClinkPlugin" = None) -> dict:
     """
     Show receivable/reserved inbound liquidity and active reservations.

@@ -307,6 +307,36 @@ def _wait_available_sat(minimum: int, timeout: float = 150.0) -> int:
     return available
 
 
+def _start_extra_relay() -> "tuple[str, subprocess.Popen]":
+    """Boot an extra in-rig Nostr relay on its own port; return (url, proc)."""
+    port = _free_port()
+    proc = subprocess.Popen(
+        [str(RIG_PYTHON), "-m", "rig.relay", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=str(RIG_DIR),
+    )
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError("extra relay exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                break
+        except OSError:
+            time.sleep(0.5)
+    else:
+        proc.terminate()
+        raise TimeoutError("extra relay did not start listening")
+    return f"ws://127.0.0.1:{port}", proc
+
+
+def _stop_relay(proc: "subprocess.Popen") -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
 @pytest.fixture()
 def second_relay(rig) -> Iterator[str]:
     """A *second* in-rig Nostr relay on its own port.
@@ -314,30 +344,11 @@ def second_relay(rig) -> Iterator[str]:
     The rig's primary relay is injected as CLINK_RELAY, so a custom relay that
     differs from it is exactly what exercises the multi-relay listener union.
     """
-    port = _free_port()
-    proc = subprocess.Popen(
-        [str(RIG_PYTHON), "-m", "rig.relay", "--host", "127.0.0.1", "--port", str(port)],
-        cwd=str(RIG_DIR),
-    )
+    url, proc = _start_extra_relay()
     try:
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                raise RuntimeError("second relay exited during startup")
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=1):
-                    break
-            except OSError:
-                time.sleep(0.5)
-        else:
-            raise TimeoutError("second relay did not start listening")
-        yield f"ws://127.0.0.1:{port}"
+        yield url
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        _stop_relay(proc)
 
 
 def test_custom_relay_offer_round_trips(rig, second_relay) -> None:
@@ -382,6 +393,69 @@ def test_custom_relay_offer_round_trips(rig, second_relay) -> None:
     # An auto-relay offer created afterwards still uses the rig's primary relay.
     auto = json.loads(_electrum_cli("clink_add_offer", "--label", "auto-after-custom"))
     assert noffer_decode(auto["noffer"]).relay != second_relay
+
+
+def test_relay_liveness_reports_advertised_relay_payable(rig) -> None:
+    """clink_check_relays (the on-demand form of the hourly liveness check)
+    probes exactly the relays existing noffers advertise. With an offer on the
+    rig's live relay, that relay must report ok on the first probe.
+
+    Earlier tests may have left offers advertising relays that are gone (the
+    custom-relay test's second relay dies with its fixture) — the sweep probes
+    those too, so keep the retry delay short and assert only on our relay.
+    """
+    from clink.noffer import noffer_decode
+
+    created = json.loads(_electrum_cli("clink_add_offer", "--label", "liveness-e2e"))
+    advertised = noffer_decode(created["noffer"]).relay
+
+    results = json.loads(_electrum_cli("clink_check_relays", "--retry_delay", "1"))
+    assert advertised in results, results
+    res = results[advertised]
+    assert res["ok"] is True and res["status"] == "ok", res
+    assert res["retried"] is False, res       # healthy relay: no confirming re-probe
+    assert res["rtt_ms"] is not None and res["rtt_ms"] > 0, res
+    assert res["checked_at"] > 0, res
+
+
+def test_relay_liveness_flags_dead_relay_and_prunes_after_removal(rig) -> None:
+    """A relay that dies *after* an offer advertised it must be flagged by the
+    liveness check (after its single confirming re-probe), while the rig's live
+    relay keeps reporting ok. Removing the offer prunes the dead relay."""
+    primary = f"ws://127.0.0.1:{rig['clink_relay']}"
+    relay_url, relay_proc = _start_extra_relay()
+    created = None
+    try:
+        # An auto offer guarantees the primary relay is advertised (and thus
+        # swept) regardless of which other tests ran before this one.
+        auto = json.loads(_electrum_cli("clink_add_offer", "--label", "liveness-auto-e2e"))
+        assert auto["relay"] == primary, auto
+        created = json.loads(_electrum_cli(
+            "clink_add_offer", "--label", "liveness-dead-e2e", "--relay", relay_url))
+        assert created["relay_payable"] is True, created
+
+        # The relay dies after the noffer went out — the exact silent failure
+        # the periodic check exists to catch.
+        _stop_relay(relay_proc)
+
+        results = json.loads(_electrum_cli(
+            "clink_check_relays", "--retry_delay", "1"))
+        res = results[relay_url]
+        assert res["ok"] is False, res
+        assert res["retried"] is True, res    # verdict came from the re-probe
+        assert res["status"] in ("unreachable", "no_readback", "error"), res
+
+        # Offers on the rig's primary relay are unaffected.
+        assert results[primary]["ok"] is True, results
+    finally:
+        _stop_relay(relay_proc)
+        if created:
+            _electrum_cli("clink_remove_offer", created["offer_id"])
+
+    # With the offer gone nothing advertises the dead relay any more, so the
+    # next sweep no longer probes (or reports) it.
+    results = json.loads(_electrum_cli("clink_check_relays", "--retry_delay", "1"))
+    assert relay_url not in results, results
 
 
 def test_unreachable_custom_relay_blocks_creation(rig) -> None:

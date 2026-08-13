@@ -47,8 +47,9 @@ from electrum.util import (
 from . import nip44, protocol
 from .devfee import MIN_PAYOUT_SAT, DevFeeLedger
 from .liquidity import LiquidityReserver, receivable_capacity_sat
+from .liveness import LivenessResult, RelayLivenessMonitor
 from .noffer import Noffer, OfferPriceType, noffer_encode
-from .offers import Offer, OfferStore, advertised_relay, listen_relays
+from .offers import Offer, OfferStore, advertised_relay, advertised_relays, listen_relays
 from .receipts import RETRY_INTERVAL_SEC, ReceiptRegistry, ReceiptTarget
 from .relay_probe import (
     ProbeResult,
@@ -124,6 +125,10 @@ class ClinkServer(Logger, EventListener):
         self._relay_selection: Optional[RelaySelection] = None
         self._relay_selection_at: float = 0.0
         self._relay_pick_lock = asyncio.Lock()
+        # Hourly liveness monitor for the relays existing noffers advertise
+        # (driven from the receipt-redelivery tick; results are session-only).
+        self.liveness = RelayLivenessMonitor(
+            probe=self._liveness_probe, clock_fn=time.time)
         # Throwaway payer pubkeys of in-flight noffer self-tests (pubkey ->
         # expiry). Requests from these are answered normally but their side
         # effects are unwound — see _issue_invoice. Session-only by design.
@@ -183,6 +188,11 @@ class ClinkServer(Logger, EventListener):
         if we are subscribed on the relay its noffer advertises."""
         return listen_relays(self.offers.list(), self.effective_relay)
 
+    def advertised_relay_urls(self) -> List[str]:
+        """Every distinct relay some existing offer's noffer advertises —
+        exactly what the periodic liveness check probes. Empty with no offers."""
+        return advertised_relays(self.offers.list(), self.effective_relay)
+
     def make_noffer(self, offer_id: str) -> str:
         """Build the noffer string a payer scans for ``offer_id``."""
         return noffer_encode(Noffer(
@@ -191,6 +201,30 @@ class ClinkServer(Logger, EventListener):
             offer=offer_id,
             price_type=OfferPriceType.SPONTANEOUS,
         ))
+
+    async def _liveness_probe(self, relay: str) -> ProbeResult:
+        """Probe callable injected into the liveness monitor (fresh proxy each run)."""
+        return await probe_relay_payable(
+            relay, ssl_context=self.ssl_context, proxy_factory=self._proxy_factory())
+
+    async def check_relay_liveness(self, *, retry_delay: Optional[float] = None,
+                                   ) -> Dict[str, LivenessResult]:
+        """Probe every relay an existing noffer advertises; log confirmed failures.
+
+        Runs hourly from the receipt tick and on demand via ``clink_check_relays``.
+        Never mutates the relay selection — a down relay is surfaced (log + Qt
+        tab) for the user to act on.
+        """
+        results = await self.liveness.run_once(
+            self.advertised_relay_urls(), retry_delay=retry_delay)
+        for res in results.values():
+            if not res.ok:
+                self.logger.warning(
+                    f"CLINK relay liveness: {res.relay} failed the payability "
+                    f"check twice ({res.status.value}"
+                    + (f": {res.detail}" if res.detail else "")
+                    + ") — offers advertising it may be unpayable")
+        return results
 
     async def probe_custom_relay(self, relay: str) -> ProbeResult:
         """Payability-probe a single user-chosen relay (same round-trip check
@@ -578,6 +612,8 @@ class ClinkServer(Logger, EventListener):
 
         Runs inside the relay taskgroup, so it also fires once on every
         reconnect/restart — covering receipts owed while we were offline.
+        The relay liveness check piggybacks on the same tick (after the
+        receipts, so its retry delay never postpones a receipt).
         """
         while True:
             try:
@@ -586,6 +622,10 @@ class ClinkServer(Logger, EventListener):
                     await self._deliver_receipt(target)
             except Exception:
                 self.logger.exception("error redelivering receipts")
+            try:
+                await self.check_relay_liveness()
+            except Exception:
+                self.logger.exception("error checking relay liveness")
             await asyncio.sleep(RETRY_INTERVAL_SEC)
 
     @event_listener
@@ -863,6 +903,23 @@ class ClinkPlugin(BasePlugin):
 
     def noffer_check_running(self) -> bool:
         return self.server is not None and self.server.check_running
+
+    def relay_liveness(self) -> Dict[str, Dict[str, Any]]:
+        """Latest per-relay liveness results (session-only; may be empty)."""
+        if self.server is None:
+            return {}
+        return {relay: res.to_dict()
+                for relay, res in self.server.liveness.results.items()}
+
+    async def check_relays(self, retry_delay: Optional[float] = None) -> Dict[str, Any]:
+        """Run the relay liveness check now (the hourly one runs on its own).
+
+        ``retry_delay`` overrides the pause before a failed relay's confirming
+        re-probe (mainly for tests); omit for the default.
+        """
+        assert self.server is not None, "wallet not loaded yet"
+        results = await self.server.check_relay_liveness(retry_delay=retry_delay)
+        return {relay: res.to_dict() for relay, res in results.items()}
 
     def liquidity_status(self) -> Dict[str, Any]:
         if self.server is None:

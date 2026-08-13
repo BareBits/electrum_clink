@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from clink.noffer import OfferPriceType
-from clink.offers import Offer, OfferStore, advertised_relay, listen_relays
+from clink.offers import (
+    Offer, OfferStore, advertised_relay, advertised_relays, listen_relays,
+)
 
 
 def test_create_and_get() -> None:
@@ -141,3 +143,24 @@ def test_listen_relays_drops_blanks_and_keeps_order() -> None:
     offers = [Offer(offer_id="a", relay="  "), Offer(offer_id="b", relay="wss://x.example")]
     assert listen_relays(offers, "") == ["wss://x.example"]
     assert listen_relays([], "wss://auto.example") == ["wss://auto.example"]
+
+
+def test_advertised_relays_covers_each_offers_noffer_once() -> None:
+    offers = [
+        Offer(offer_id="a"),                              # automatic
+        Offer(offer_id="b", relay="wss://one.example"),
+        Offer(offer_id="c", relay="wss://one.example"),   # duplicate
+        Offer(offer_id="d", relay="wss://auto.example"),  # same as default
+    ]
+    assert advertised_relays(offers, "wss://auto.example") == [
+        "wss://auto.example", "wss://one.example"]
+
+
+def test_advertised_relays_empty_without_offers() -> None:
+    # Unlike listen_relays, no offers -> nothing advertised -> nothing to probe.
+    assert advertised_relays([], "wss://auto.example") == []
+
+
+def test_advertised_relays_all_custom_skips_default() -> None:
+    offers = [Offer(offer_id="a", relay="wss://mine.example")]
+    assert advertised_relays(offers, "wss://auto.example") == ["wss://mine.example"]
