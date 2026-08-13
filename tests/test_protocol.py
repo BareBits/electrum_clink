@@ -8,13 +8,18 @@ from clink.protocol import (
     ERR_INVALID_AMOUNT,
     ERR_INVALID_OFFER,
     ERR_UNSUPPORTED_FEATURE,
+    MAX_AMOUNT_SAT,
+    MAX_OFFER_ID_LEN,
     MEMO_MAX_LEN,
     IssueInvoice,
     SendError,
     effective_description,
     invoice_message,
+    quantize_available_sat,
     receipt_payload,
+    request_amount_sat,
     request_description,
+    request_offer_id,
     resolve_request,
 )
 
@@ -90,6 +95,84 @@ def test_exact_available_is_allowed() -> None:
 def test_receipt_payload_is_sdk_shape() -> None:
     # The reference @shocknet/clink-sdk NofferReceipt type is exactly {res: 'ok'}.
     assert receipt_payload() == {"res": "ok"}
+
+
+# ---- request field validation (attacker-controlled input) ----
+
+def test_request_offer_id_accepts_sane_strings() -> None:
+    assert request_offer_id({"offer": "abc123"}) == "abc123"
+    assert request_offer_id({"offer": "z" * MAX_OFFER_ID_LEN}) == "z" * MAX_OFFER_ID_LEN
+
+
+def test_request_offer_id_rejects_mistyped_or_oversized() -> None:
+    for bad in (None, 5, 1.5, True, ["a"], {"a": 1}, b"x", "", "z" * (MAX_OFFER_ID_LEN + 1)):
+        assert request_offer_id({"offer": bad}) is None
+    assert request_offer_id({}) is None
+
+
+def test_request_amount_accepts_int_and_digit_string() -> None:
+    assert request_amount_sat({"amount_sats": 42}) == 42
+    assert request_amount_sat({"amount_sats": "42"}) == 42
+    assert request_amount_sat({"amount_sats": MAX_AMOUNT_SAT}) == MAX_AMOUNT_SAT
+
+
+def test_request_amount_rejects_bool() -> None:
+    # bool is an int subclass; a JSON `true` must not become a 1-sat request.
+    assert request_amount_sat({"amount_sats": True}) is None
+    assert request_amount_sat({"amount_sats": False}) is None
+
+
+def test_request_amount_rejects_floats_and_garbage() -> None:
+    for bad in (1.5, "1.5", "1e6", "-5", "+5", " 5", "5 ", [], {}, None,
+                "9" * 17, "0x10", ""):
+        assert request_amount_sat({"amount_sats": bad}) is None, bad
+
+
+def test_request_amount_rejects_non_ascii_digits() -> None:
+    # "²".isdigit() is True but int("²") raises; "٣" would silently parse.
+    # Both must be refused without raising (attacker-controlled input).
+    for bad in ("²", "٣٣", "１２３"):
+        assert request_amount_sat({"amount_sats": bad}) is None, bad
+
+
+def test_request_amount_rejects_out_of_range() -> None:
+    assert request_amount_sat({"amount_sats": 0}) is None
+    assert request_amount_sat({"amount_sats": -100}) is None
+    assert request_amount_sat({"amount_sats": MAX_AMOUNT_SAT + 1}) is None
+    # A huge JSON integer must be refused by range, never by raising.
+    assert request_amount_sat({"amount_sats": 10 ** 100}) is None
+
+
+def test_mistyped_amount_resolves_to_invalid_amount_error() -> None:
+    res = resolve_request({"amount_sats": True}, _offer(), available_sat=100_000)
+    assert isinstance(res, SendError) and res.payload["code"] == ERR_INVALID_AMOUNT
+
+
+# ---- capacity quantization (liquidity-oracle mitigation) ----
+
+def test_quantize_rounds_down_to_two_sig_figs() -> None:
+    assert quantize_available_sat(1_234_567) == 1_200_000
+    assert quantize_available_sat(999) == 990
+    assert quantize_available_sat(101) == 100
+
+
+def test_quantize_preserves_small_and_zero_values() -> None:
+    assert quantize_available_sat(0) == 0
+    assert quantize_available_sat(-5) == 0
+    assert quantize_available_sat(1) == 1
+    assert quantize_available_sat(99) == 99
+    assert quantize_available_sat(100_000) == 100_000  # already round
+
+
+def test_quantize_never_rounds_up() -> None:
+    for v in (1, 99, 101, 12_345, 987_654_321):
+        assert quantize_available_sat(v) <= v
+
+
+def test_error_range_max_is_quantized() -> None:
+    res = resolve_request({"amount_sats": 999_999_999}, _offer(), available_sat=1_234_567)
+    assert isinstance(res, SendError)
+    assert res.payload["range"]["max"] == 1_200_000
 
 
 # ---- payer description extraction / invoice memo composition ----

@@ -145,6 +145,59 @@ def test_forget_drops_entry() -> None:
     assert reg.pending_count() == 0
 
 
+def test_sweep_returns_expired_unpaid_hashes_for_gc() -> None:
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("expired1", "p", "q", expires_at=clock() + 60)
+    reg.remember("expired2", "p", "q", expires_at=clock() + 60)
+    reg.remember("alive", "p", "q", expires_at=clock() + 10_000)
+    clock.tick(120)
+    assert sorted(reg.sweep()) == ["expired1", "expired2"]
+    assert reg.sweep() == []  # idempotent: nothing left to drop
+
+
+def test_sweep_never_returns_abandoned_owed_receipts() -> None:
+    # An abandoned owed entry was PAID — its wallet request is the merchant's
+    # record and must never be handed to the garbage collector.
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("paid", "p", "q", expires_at=clock() + 60)
+    reg.mark_due("paid")
+    clock.tick(RETRY_MAX_SEC + 1)
+    assert reg.sweep() == []
+    assert reg.pending_count() == 0  # dropped from the registry all the same
+
+
+def test_pending_count_for_counts_only_live_unpaid_of_that_payer() -> None:
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("r1", "payerA", "q", expires_at=clock() + 120)
+    reg.remember("r2", "payerA", "q", expires_at=clock() + 120)
+    reg.remember("r3", "payerB", "q", expires_at=clock() + 120)   # other payer
+    reg.remember("r4", "payerA", "q", expires_at=clock() + 120)
+    reg.mark_due("r4")                                            # paid -> not pending
+    reg.remember("r5", "payerA", "q", expires_at=clock() + 10)
+    clock.tick(11)                                                # r5 expired
+    assert reg.pending_count_for("payerA") == 2
+    assert reg.pending_count_for("payerB") == 1
+    assert reg.pending_count_for("nobody") == 0
+
+
+def test_remember_returns_evicted_hashes() -> None:
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    evicted: List[str] = []
+    for i in range(MAX_PENDING + 3):
+        evicted += reg.remember(f"r{i}", "p", "q", expires_at=clock() + 1_000 + i)
+    # Soonest-to-expire (oldest) entries were evicted, exactly the overflow.
+    assert evicted == ["r0", "r1", "r2"]
+    assert reg.pending_count() == MAX_PENDING
+
+
 def test_cap_evicts_unpaid_but_never_owed() -> None:
     storage: Dict[str, Any] = {}
     clock = Clock()

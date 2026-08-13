@@ -29,22 +29,29 @@ async def request_invoice(
     *,
     description: Optional[str] = None,
     timeout: float = 25.0,
+    payload_override: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Send an offer request for ``noffer_str`` and return the decrypted reply.
 
     Returns the response payload dict: ``{"bolt11": ...}`` on success or
     ``{"code", "error", ...}`` on a protocol error. ``description`` carries the
     optional NIP-69 payer note the service may fold into the invoice memo.
+    ``payload_override`` replaces the request payload entirely — used by the
+    hardening tests to deliver deliberately malformed requests through the
+    real relay/crypto stack.
     """
     offer = noffer_decode(noffer_str)
     sk = PrivateKey()
     my_pubkey = sk.public_key.hex()
 
-    payload: Dict[str, Any] = {"offer": offer.offer}
-    if amount_sats is not None:
-        payload["amount_sats"] = amount_sats
-    if description is not None:
-        payload["description"] = description
+    if payload_override is not None:
+        payload: Dict[str, Any] = payload_override
+    else:
+        payload = {"offer": offer.offer}
+        if amount_sats is not None:
+            payload["amount_sats"] = amount_sats
+        if description is not None:
+            payload["description"] = description
     content = nip44.encrypt_to(sk.raw_secret, offer.pubkey, json.dumps(payload))
 
     manager = aionostr.Manager(relays=[offer.relay], private_key=sk.hex())

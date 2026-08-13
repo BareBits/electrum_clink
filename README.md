@@ -52,7 +52,19 @@ An *optional* .1% dev fee is included by default, which can be disabled in the s
   liquidity it needs until it is paid or expires (default 120 s, configurable),
   so two concurrent requests can't both be promised the same capacity. A request
   that exceeds available (unreserved) capacity gets `error code 5` with the
-  acceptable range.
+  acceptable range. The advertised max is rounded *down* to two significant
+  figures so the error can't be used to track the wallet's exact receivable
+  balance over time (any amount at or below the advertised max is still
+  always accepted).
+* **Hostile-input hardening.** Requests are only accepted within a tight
+  `created_at` freshness window (an expiration tag can shrink it, never extend
+  it), duplicate event ids are dropped, and decrypted payload fields are
+  strictly type- and size-validated before use. Each payer pubkey may hold at
+  most 200 outstanding unpaid invoices (generous, because one pubkey may be a
+  merchant frontend serving many customers); requests beyond that get a
+  retryable `error code 2`. Wallet requests behind expired unpaid CLINK
+  invoices are garbage-collected automatically, so request spam cannot grow
+  the wallet file without bound.
 * **Check noffers.** The CLINK tab's "Check noffers" button (and the
   `clink_check_noffers` CLI command) self-tests every offer end to end: the
   plugin plays payer with a throwaway Nostr identity — connect to the noffer's

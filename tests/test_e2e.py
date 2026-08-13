@@ -224,6 +224,44 @@ def test_over_capacity_returns_error_5(rig) -> None:
     assert resp["range"]["max"] <= available + 1
 
 
+def test_error_range_does_not_reveal_exact_capacity(rig) -> None:
+    """The invalid-amount range max must be quantized (liquidity-oracle fix):
+    it never exceeds the true capacity and is stable under re-quantization,
+    i.e. it carries at most two significant figures."""
+    from clink.protocol import quantize_available_sat
+
+    noffer = _fresh_noffer()
+    available = _available_sat()
+    resp = asyncio.run(request_invoice(noffer, amount_sats=available + 1_000_000, timeout=30))
+    assert resp.get("code") == 5, resp
+    reported = resp["range"]["max"]
+    assert reported <= available + 1
+    assert quantize_available_sat(reported) == reported
+
+
+def test_malformed_offer_field_gets_clean_error(rig) -> None:
+    """A request whose ``offer`` is a JSON array must be answered with a clean
+    Invalid Offer error — regression for the unhashable-lookup TypeError that
+    used to kill the dispatch (and send nothing) before the security review."""
+    noffer = _fresh_noffer()
+    resp = asyncio.run(request_invoice(
+        noffer, amount_sats=None, timeout=30,
+        payload_override={"offer": ["not-a-string"], "amount_sats": 5}))
+    assert resp.get("code") == 1, resp
+
+
+def test_bool_amount_gets_invalid_amount_error(rig) -> None:
+    """JSON ``true`` as the amount must not mint a 1-sat invoice."""
+    from clink.noffer import noffer_decode
+
+    noffer = _fresh_noffer()
+    offer_id = noffer_decode(noffer).offer
+    resp = asyncio.run(request_invoice(
+        noffer, amount_sats=None, timeout=30,
+        payload_override={"offer": offer_id, "amount_sats": True}))
+    assert resp.get("code") == 5, resp
+
+
 def test_issued_invoice_locks_liquidity(rig) -> None:
     noffer = _fresh_noffer()
     available = _available_sat()

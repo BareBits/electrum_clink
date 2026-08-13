@@ -57,6 +57,49 @@ def receipt_payload() -> Dict[str, Any]:
 # we keep the *combined* memo within the same budget so the bolt11 stays tidy.
 MEMO_MAX_LEN = 100
 
+# Bounds for decrypted (payer-controlled) request fields. Our own offer ids are
+# 16 hex chars; 64 leaves headroom for other issuers' id schemes while refusing
+# the pathological multi-kilobyte strings a hostile payer could otherwise push
+# into logs, storage and the GUI.
+MAX_OFFER_ID_LEN = 64
+# Total bitcoin supply in sats — no honest request can name more.
+MAX_AMOUNT_SAT = 21_000_000 * 100_000_000
+# Raw ``description`` budget *before* sanitizing. Cleaning only ever shrinks
+# text, so a few times the memo cap is always enough to fill it; slicing first
+# bounds the work done on attacker-sized input.
+_RAW_DESCRIPTION_MAX_LEN = MEMO_MAX_LEN * 4
+
+
+def request_offer_id(req: Dict[str, Any]) -> Optional[str]:
+    """Extract the request's offer id, validated.
+
+    Returns the id only when it is a non-empty string of sane length; ``None``
+    for a missing, mistyped (e.g. list/dict — which must never reach a dict
+    lookup) or oversized value. The caller treats ``None`` as "unknown offer".
+    """
+    raw = req.get("offer")
+    if not isinstance(raw, str) or not raw or len(raw) > MAX_OFFER_ID_LEN:
+        return None
+    return raw
+
+
+def quantize_available_sat(available_sat: int, *, sig_figs: int = 2) -> int:
+    """Round receivable capacity *down* to ``sig_figs`` significant figures.
+
+    The invalid-amount error must advertise a range (NIP-69), but reporting the
+    exact receivable capacity lets anyone holding the public noffer track the
+    wallet's balance changes over time. Rounding down never over-promises: the
+    gate itself keeps using the exact value, so any amount at or below the
+    advertised max is always accepted.
+    """
+    if available_sat <= 0:
+        return 0
+    digits = len(str(available_sat))
+    if digits <= sig_figs:
+        return available_sat
+    factor = 10 ** (digits - sig_figs)
+    return (available_sat // factor) * factor
+
 
 def request_description(req: Dict[str, Any]) -> Optional[str]:
     """Extract the payer's optional note from a request, sanitized.
@@ -69,6 +112,8 @@ def request_description(req: Dict[str, Any]) -> Optional[str]:
     raw = req.get("description")
     if not isinstance(raw, str):
         return None
+    # Bound the work first: the plaintext can be tens of KB, the memo never is.
+    raw = raw[:_RAW_DESCRIPTION_MAX_LEN]
     # Replace anything non-printable (newlines, control chars) with a space,
     # then collapse whitespace runs.
     cleaned = " ".join(
@@ -110,15 +155,26 @@ def request_amount_sat(req: Dict[str, Any]) -> Optional[int]:
     """Extract the payer's requested amount, tolerating both field spellings.
 
     The reference SDK sends ``amount_sats``; the original NIP-69 draft used
-    ``amount``. Accept either, preferring the SDK field.
+    ``amount``. Accept either, preferring the SDK field. Strict about types:
+    an integer, or a string of digits (legacy payers) — never a bool (a JSON
+    ``true`` must not become a 1-sat request), float, or anything outside
+    ``(0, MAX_AMOUNT_SAT]``. Returns ``None`` for anything else, which the
+    resolver answers with an invalid-amount error.
     """
     raw = req.get("amount_sats", req.get("amount"))
-    if raw is None:
+    if isinstance(raw, bool):  # bool is an int subclass; reject it explicitly
         return None
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
+    if isinstance(raw, str):
+        # ASCII-only: isdigit() alone also accepts unicode digits (e.g. "²")
+        # that int() then raises on.
+        if not (raw.isascii() and raw.isdigit()) or len(raw) > 16:
+            return None
+        raw = int(raw)
+    if not isinstance(raw, int):
         return None
+    if not (0 < raw <= MAX_AMOUNT_SAT):
+        return None
+    return raw
 
 
 @dataclass
@@ -158,11 +214,12 @@ def resolve_request(
 
     amount = request_amount_sat(req)
     if amount is None or amount < min_sat:
-        # Spontaneous offers require the payer to name a positive amount.
-        return SendError(invalid_amount_payload(min_sat, available_sat))
+        # Spontaneous offers require the payer to name a positive amount. The
+        # advertised max is quantized so the error is not an exact-capacity oracle.
+        return SendError(invalid_amount_payload(min_sat, quantize_available_sat(available_sat)))
 
     if amount > available_sat:
         # Not enough inbound liquidity (or it is all reserved) -> no invoice.
-        return SendError(invalid_amount_payload(min_sat, available_sat))
+        return SendError(invalid_amount_payload(min_sat, quantize_available_sat(available_sat)))
 
     return IssueInvoice(amount)

@@ -22,7 +22,7 @@ from electrum_aionostr.key import PrivateKey
 
 from electrum.logging import Logger
 from electrum.plugin import BasePlugin, hook
-from electrum.invoices import PR_PAID, Invoice, Request
+from electrum.invoices import PR_EXPIRED, PR_PAID, PR_UNPAID, Invoice, Request
 from electrum.lnutil import RECEIVED
 from electrum.lnurl import (
     LNURL6Data,
@@ -68,8 +68,16 @@ CLINK_EVENT_KIND = 21001
 CLINK_VERSION = "1"
 # Ignore requests older than this; the payer has almost certainly timed out.
 MAX_REQUEST_AGE_SEC = 60
+# Reject requests dated further in the future than this. A future-dated event
+# would otherwise look "fresh" (and thus replayable) until its timestamp lapses.
+MAX_CLOCK_SKEW_SEC = 60
 # Cap on remembered request-event ids (replay guard) to bound memory.
 SEEN_EVENTS_MAX = 4096
+# Cap on outstanding *unpaid* invoices per payer pubkey. Generous because one
+# pubkey may be a merchant frontend fanning out many customers' requests; slots
+# free up as invoices are paid or expire (tracked via the receipt registry, so
+# the cap survives restarts). Over-cap requests get a retryable error.
+MAX_PENDING_PER_PAYER = 200
 # How long a payable-relay selection is trusted before it is re-probed. The
 # user asked for a cap of 24h; a probe runs at offer creation when this lapses.
 RELAY_CACHE_TTL_SEC = 24 * 60 * 60
@@ -465,12 +473,17 @@ class ClinkServer(Logger, EventListener):
         # Skip our own responses (kind is shared by request and response).
         if event.pubkey == self.pubkey_hex:
             return
-        if self._already_seen(event.id):
-            return
-        if event.expires_at() is not None:
+        # Freshness is enforced on created_at unconditionally: an expiration tag
+        # may only *shrink* the acceptance window, never extend it — otherwise a
+        # compromised relay could replay a captured request for the tag's whole
+        # lifetime. Future-dated events are rejected for the same reason.
+        try:
             if event.is_expired():
                 return
-        elif event.created_at < int(time.time()) - MAX_REQUEST_AGE_SEC:
+        except Exception:
+            return  # unparseable expiration tag -> treat as invalid, drop
+        now = int(time.time())
+        if not (now - MAX_REQUEST_AGE_SEC <= event.created_at <= now + MAX_CLOCK_SKEW_SEC):
             return
 
         try:
@@ -482,14 +495,32 @@ class ClinkServer(Logger, EventListener):
             self.logger.debug("could not decrypt/parse clink request", exc_info=True)
             return
 
+        # Replay guard, checked only for decryptable requests: junk events
+        # (which anyone can mass-produce with throwaway keys) must not be able
+        # to evict real entries from the bounded seen-cache and reopen a
+        # replay window for a recently answered request.
+        if self._already_seen(event.id):
+            return
+
         selftest = self.is_selftest_payer(event.pubkey)
-        offer = self.offers.get(req.get("offer", ""))
+        offer_id = protocol.request_offer_id(req)
+        offer = self.offers.get(offer_id) if offer_id is not None else None
         resolution = protocol.resolve_request(req, offer, self.reserver.available_sat())
         if isinstance(resolution, protocol.SendError):
-            self._record(req.get("offer", ""), protocol.request_amount_sat(req),
+            self._record(offer_id or "", protocol.request_amount_sat(req),
                          f"error {resolution.payload.get('code')}"
                          + (" (self-test)" if selftest else ""))
             await self.send_response(event, resolution.payload)
+            return
+
+        # Per-payer ceiling on outstanding unpaid invoices: bounds the wallet
+        # requests and liquidity one pubkey can hold. Answered with a retryable
+        # error so an honest-but-busy merchant frontend recovers as its
+        # invoices are paid or expire.
+        if not selftest and self.receipts.pending_count_for(event.pubkey) >= MAX_PENDING_PER_PAYER:
+            self._record(offer_id or "", resolution.amount_sat, "error 2 (payer request cap)")
+            await self.send_response(event, protocol.error_payload(
+                protocol.ERR_TEMPORARY_FAILURE, "Temporary Failure"))
             return
 
         # Fold in the payer's requested memo only when this offer permits it;
@@ -499,8 +530,10 @@ class ClinkServer(Logger, EventListener):
             event, offer, resolution.amount_sat, description, selftest=selftest)
 
     def _record(self, offer_id: str, amount: Optional[int], result: str) -> None:
+        # offer_id can originate from a hostile payer; keep the activity feed
+        # (and the Qt tab rendering it) bounded per entry.
         self.recent_activity.append({
-            "time": int(time.time()), "offer": offer_id,
+            "time": int(time.time()), "offer": str(offer_id)[:32],
             "amount_sat": amount, "result": result,
         })
 
@@ -519,10 +552,12 @@ class ClinkServer(Logger, EventListener):
             info = self.wallet.lnworker.get_payment_info(request.payment_hash, direction=RECEIVED)
             _, bolt11 = self.wallet.lnworker.get_bolt11_invoice(
                 payment_info=info, message=message, fallback_address=None)
-        except Exception as e:
+        except Exception:
+            # Deliberately generic: internal exception text (paths, wallet
+            # state) must not leak to an anonymous payer. Details are logged.
             self.logger.exception("failed to create invoice")
             await self.send_response(
-                event, protocol.error_payload(protocol.ERR_TEMPORARY_FAILURE, f"Temporary Failure: {str(e)[:80]}"))
+                event, protocol.error_payload(protocol.ERR_TEMPORARY_FAILURE, "Temporary Failure"))
             return
 
         # Atomically lock the inbound liquidity for this invoice's lifetime.
@@ -533,15 +568,20 @@ class ClinkServer(Logger, EventListener):
             self.wallet.delete_request(key)
             self._record(req_offer_id(offer), amount_sat, "error 5 (lost race)")
             await self.send_response(
-                event, protocol.invalid_amount_payload(1, self.reserver.available_sat()))
+                event, protocol.invalid_amount_payload(
+                    1, protocol.quantize_available_sat(self.reserver.available_sat())))
             return
 
         if not selftest:
             # Remember this hash so the dev fee accrues if (and only if) it is paid.
             self.devfee.mark_issued(request.rhash)
             # Remember who to send the payment receipt to once this invoice settles.
-            self.receipts.remember(request.rhash, event.pubkey, event.id,
-                                   expires_at=time.time() + expiry)
+            evicted = self.receipts.remember(request.rhash, event.pubkey, event.id,
+                                             expires_at=time.time() + expiry)
+            # An entry evicted by the registry cap must not orphan its wallet
+            # request — drop it (if still unpaid) along with the entry.
+            for stale_rhash in (evicted or []):
+                self._delete_stale_request(stale_rhash)
             self.logger.info(f"issued {amount_sat} sat invoice for offer {req_offer_id(offer)} "
                              f"(rhash={request.rhash[:10]}…), liquidity locked for {expiry}s")
             self._record(req_offer_id(offer), amount_sat, "invoice issued")
@@ -576,6 +616,24 @@ class ClinkServer(Logger, EventListener):
             self.manager,
             **self._encrypt_event_args(request_event.pubkey, request_event.id, payload),
         ))
+
+    def _delete_stale_request(self, rhash: str) -> None:
+        """Garbage-collect the wallet request behind a dropped registry entry.
+
+        Every CLINK invoice creates a persisted wallet request; without this,
+        an attacker spamming requests would grow the wallet DB without bound.
+        Deletes only a still-unpaid (or expired) request — a paid one is the
+        merchant's record, and an in-flight payment must be able to settle.
+        """
+        try:
+            request = self.wallet.get_request(rhash)
+            if request is None:
+                return
+            if self.wallet.get_invoice_status(request) in (PR_UNPAID, PR_EXPIRED):
+                self.wallet.delete_request(rhash)
+                self.logger.debug(f"GC'd expired clink request {rhash[:10]}…")
+        except Exception:
+            self.logger.exception(f"could not GC clink request {rhash[:10]}…")
 
     # --- payment receipts ------------------------------------------------
 
@@ -617,7 +675,10 @@ class ClinkServer(Logger, EventListener):
         """
         while True:
             try:
-                self.receipts.sweep()
+                # Sweeping returns the expired-unpaid invoices it dropped; their
+                # persisted wallet requests are garbage-collected alongside.
+                for stale_rhash in self.receipts.sweep():
+                    self._delete_stale_request(stale_rhash)
                 for target in self.receipts.due_targets():
                     await self._deliver_receipt(target)
             except Exception:

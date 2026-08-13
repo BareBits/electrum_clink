@@ -92,11 +92,16 @@ class ReceiptRegistry:
     # --- lifecycle -------------------------------------------------------
 
     def remember(self, rhash: str, payer_pubkey: str, request_event_id: str,
-                 expires_at: float) -> None:
+                 expires_at: float) -> List[str]:
         """Record that an invoice was issued; a receipt may later be owed.
 
         ``expires_at`` is the invoice's own expiry: if the invoice is never paid,
         :meth:`sweep` drops the entry once this passes (no receipt is ever owed).
+
+        Returns the payment hashes of any awaiting-payment entries evicted to
+        stay under :data:`MAX_PENDING`, so the caller can garbage-collect their
+        wallet requests too — an evicted entry must not leave an orphaned
+        request behind.
         """
         entries = self._load()
         entries[rhash] = {
@@ -108,8 +113,9 @@ class ReceiptRegistry:
             "attempts": 0,
             "last_attempt": 0.0,
         }
-        self._enforce_cap(entries)
+        evicted = self._enforce_cap(entries)
         self._save(entries)
+        return evicted
 
     def forget(self, rhash: str) -> None:
         """Drop a remembered invoice (e.g. it was cancelled before payment)."""
@@ -159,7 +165,7 @@ class ReceiptRegistry:
         An entry that has never been attempted (``last_attempt == 0``) is always
         returned; otherwise it must be at least :data:`RETRY_INTERVAL_SEC` old.
         """
-        entries = self._sweep(self._load())
+        entries, _expired = self._sweep(self._load())
         now = self._now_fn()
         out: List[ReceiptTarget] = []
         for rhash, entry in entries.items():
@@ -173,16 +179,25 @@ class ReceiptRegistry:
 
     # --- maintenance -----------------------------------------------------
 
-    def sweep(self) -> None:
-        """Drop expired-unpaid and abandoned (over-retried) entries; persist."""
+    def sweep(self) -> List[str]:
+        """Drop expired-unpaid and abandoned (over-retried) entries; persist.
+
+        Returns the payment hashes of the *expired-unpaid* entries dropped, so
+        the runtime can garbage-collect their wallet requests. Abandoned owed
+        entries are never returned: their invoices were paid, and a paid request
+        is the merchant's record.
+        """
         before = self._load()
-        after = self._sweep(dict(before))
+        after, expired_unpaid = self._sweep(dict(before))
         if after != before:
             self._save(after)
+        return expired_unpaid
 
-    def _sweep(self, entries: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    def _sweep(self, entries: Dict[str, Dict[str, Any]],
+               ) -> "tuple[Dict[str, Dict[str, Any]], List[str]]":
         now = self._now_fn()
         kept: Dict[str, Dict[str, Any]] = {}
+        expired_unpaid: List[str] = []
         for rhash, entry in entries.items():
             if entry.get("due"):
                 # Owed: keep retrying until we give up RETRY_MAX_SEC after payment.
@@ -191,25 +206,46 @@ class ReceiptRegistry:
             else:
                 # Not yet paid: once the invoice expires, no receipt is ever owed.
                 if now >= float(entry.get("expires_at", 0.0)):
+                    expired_unpaid.append(rhash)
                     continue
             kept[rhash] = entry
-        return kept
+        return kept, expired_unpaid
 
-    def _enforce_cap(self, entries: Dict[str, Dict[str, Any]]) -> None:
-        """Bound the map: evict the soonest-to-expire *un-owed* entries first."""
+    def _enforce_cap(self, entries: Dict[str, Dict[str, Any]]) -> List[str]:
+        """Bound the map: evict the soonest-to-expire *un-owed* entries first.
+
+        Returns the evicted payment hashes (empty when under the cap).
+        """
         if len(entries) <= MAX_PENDING:
-            return
+            return []
         # Never evict an owed receipt to make room; only prune awaiting-payment
         # ones (the oldest by expiry), which would be swept shortly anyway.
         prunable = [k for k, e in entries.items() if not e.get("due")]
         prunable.sort(key=lambda k: float(entries[k].get("expires_at", 0.0)))
-        for k in prunable[: len(entries) - MAX_PENDING]:
+        evicted = prunable[: len(entries) - MAX_PENDING]
+        for k in evicted:
             entries.pop(k, None)
+        return evicted
 
     # --- introspection ---------------------------------------------------
 
     def pending_count(self) -> int:
         return len(self._load())
+
+    def pending_count_for(self, payer_pubkey: str) -> int:
+        """Awaiting-payment (not yet paid, unexpired) entries for one payer.
+
+        Backs the per-payer cap on outstanding unpaid invoices. Expired entries
+        are excluded even before a sweep prunes them, so a stale registry can
+        never lock a payer out longer than their invoices actually lived.
+        """
+        now = self._now_fn()
+        return sum(
+            1 for e in self._load().values()
+            if not e.get("due")
+            and e.get("payer") == payer_pubkey
+            and now < float(e.get("expires_at", 0.0))
+        )
 
     def owed_count(self) -> int:
         return sum(1 for e in self._load().values() if e.get("due"))
