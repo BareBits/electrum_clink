@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -209,7 +210,9 @@ def test_disallowed_payer_memo_is_ignored(rig) -> None:
 
 def test_payment_receipt_delivered_after_payment(rig) -> None:
     # Full round trip: request -> invoice -> pay it from LND -> the plugin should
-    # send the payer a kind-21001 {"res":"ok"} receipt on the same subscription.
+    # send the payer a kind-21001 {"res":"ok","preimage":...} receipt (CLINK
+    # spec: standard payments MUST carry the settlement preimage) on the same
+    # subscription.
     noffer = _fresh_noffer()
     available = _available_sat()
     assert available > 0, "rig wallet should have inbound liquidity after seeding"
@@ -221,7 +224,8 @@ def test_payment_receipt_delivered_after_payment(rig) -> None:
     ))
     assert "bolt11" in result["invoice"], result
     assert result["invoice"]["bolt11"].lower().startswith("lnbcrt")
-    assert result["receipt"] == {"res": "ok"}, result
+    assert result["receipt"]["res"] == "ok", result
+    assert re.fullmatch(r"[0-9a-f]{64}", result["receipt"]["preimage"]), result
 
 
 def test_over_capacity_returns_error_5(rig) -> None:

@@ -9,16 +9,20 @@ from clink.protocol import (
     ERR_INVALID_OFFER,
     ERR_UNSUPPORTED_FEATURE,
     MAX_AMOUNT_SAT,
+    MAX_INVOICE_EXPIRY_SEC,
     MAX_OFFER_ID_LEN,
     MEMO_MAX_LEN,
+    MIN_INVOICE_EXPIRY_SEC,
     IssueInvoice,
     SendError,
     effective_description,
+    effective_expiry_sec,
     invoice_message,
     quantize_available_sat,
     receipt_payload,
     request_amount_sat,
     request_description,
+    request_expiry_sec,
     request_offer_id,
     resolve_request,
 )
@@ -92,9 +96,45 @@ def test_exact_available_is_allowed() -> None:
     assert isinstance(res, IssueInvoice)
 
 
-def test_receipt_payload_is_sdk_shape() -> None:
-    # The reference @shocknet/clink-sdk NofferReceipt type is exactly {res: 'ok'}.
+def test_receipt_payload_without_preimage_is_internal_settlement() -> None:
+    # No preimage -> an "internal settlement" acknowledgment; this is also the
+    # reference @shocknet/clink-sdk NofferReceipt shape ({res: 'ok'}).
     assert receipt_payload() == {"res": "ok"}
+    assert receipt_payload(None) == {"res": "ok"}
+
+
+def test_receipt_payload_with_preimage() -> None:
+    preimage = "ab" * 32
+    assert receipt_payload(preimage) == {"res": "ok", "preimage": preimage}
+
+
+# ---- requested invoice expiry (expires_in_seconds) ---------------------------
+
+def test_request_expiry_absent_is_none() -> None:
+    assert request_expiry_sec({}) is None
+    assert request_expiry_sec({"amount_sats": 100}) is None
+
+
+def test_request_expiry_accepts_positive_int() -> None:
+    assert request_expiry_sec({"expires_in_seconds": 300}) == 300
+
+
+def test_request_expiry_rejects_bool_float_string() -> None:
+    for bad in (True, False, 120.5, "300"):
+        assert request_expiry_sec({"expires_in_seconds": bad}) is None
+
+
+def test_request_expiry_is_clamped() -> None:
+    # Below the floor -> raised; above the cap -> pinned.
+    assert request_expiry_sec({"expires_in_seconds": 1}) == MIN_INVOICE_EXPIRY_SEC
+    assert request_expiry_sec({"expires_in_seconds": -50}) == MIN_INVOICE_EXPIRY_SEC
+    assert request_expiry_sec({"expires_in_seconds": 10 ** 9}) == MAX_INVOICE_EXPIRY_SEC
+
+
+def test_effective_expiry_uses_request_or_default() -> None:
+    assert effective_expiry_sec({}, 120) == 120
+    assert effective_expiry_sec({"expires_in_seconds": 300}, 120) == 300
+    assert effective_expiry_sec({"expires_in_seconds": True}, 120) == 120
 
 
 # ---- request field validation (attacker-controlled input) ----

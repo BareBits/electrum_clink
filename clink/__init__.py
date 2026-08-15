@@ -5,6 +5,12 @@ Registers the plugin's config vars and command-line API. The runtime lives in
 modules and are independently unit-tested.
 """
 
+from typing import TYPE_CHECKING
+
+from electrum.commands import plugin_command
+from electrum.simple_config import ConfigVar, SimpleConfig
+
+
 # --- external-plugin loader shim (Electrum 4.7.x) --------------------------
 # When Electrum installs us from a zip, its loader registers this package in
 # ``sys.modules`` under ``electrum_external_plugins.clink`` but (a) never creates
@@ -44,13 +50,9 @@ _repair_external_plugin_identity()
 del _repair_external_plugin_identity
 # ---------------------------------------------------------------------------
 
-from typing import TYPE_CHECKING
-
-from electrum.commands import plugin_command
-from electrum.simple_config import SimpleConfig, ConfigVar
-
 if TYPE_CHECKING:
     from electrum.commands import Commands
+
     from .clink_plugin import ClinkPlugin
 
 plugin_name = "clink"

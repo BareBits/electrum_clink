@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from clink.noffer import OfferPriceType
 from clink.offers import (
-    Offer, OfferStore, advertised_relay, advertised_relays, listen_relays,
+    Offer,
+    OfferStore,
+    advertised_relay,
+    advertised_relays,
+    listen_relays,
 )
 
 

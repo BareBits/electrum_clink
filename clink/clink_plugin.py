@@ -17,13 +17,7 @@ from collections import OrderedDict, deque
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 import electrum_aionostr as aionostr
-from electrum_aionostr.event import Event as nEvent
-from electrum_aionostr.key import PrivateKey
-
-from electrum.logging import Logger
-from electrum.plugin import BasePlugin, hook
 from electrum.invoices import PR_EXPIRED, PR_PAID, PR_UNPAID, Invoice, Request
-from electrum.lnutil import RECEIVED
 from electrum.lnurl import (
     LNURL6Data,
     LNURLError,
@@ -32,6 +26,9 @@ from electrum.lnurl import (
     lightning_address_to_url,
     request_lnurl,
 )
+from electrum.lnutil import RECEIVED
+from electrum.logging import Logger
+from electrum.plugin import BasePlugin, hook
 from electrum.util import (
     EventListener,
     OldTaskGroup,
@@ -43,13 +40,21 @@ from electrum.util import (
     log_exceptions,
     make_aiohttp_proxy_connector,
 )
+from electrum_aionostr.event import Event as nEvent
+from electrum_aionostr.key import PrivateKey
 
 from . import nip44, protocol
 from .devfee import MIN_PAYOUT_SAT, DevFeeLedger
 from .liquidity import LiquidityReserver, receivable_capacity_sat
 from .liveness import LivenessResult, RelayLivenessMonitor
 from .noffer import Noffer, OfferPriceType, noffer_encode
-from .offers import Offer, OfferStore, advertised_relay, advertised_relays, listen_relays
+from .offers import (
+    Offer,
+    OfferStore,
+    advertised_relay,
+    advertised_relays,
+    listen_relays,
+)
 from .receipts import RETRY_INTERVAL_SEC, ReceiptRegistry, ReceiptTarget
 from .relay_probe import (
     ProbeResult,
@@ -58,7 +63,7 @@ from .relay_probe import (
     probe_relay_payable,
     select_payable_relay,
 )
-from .selftest import CheckResult, CheckStatus, check_noffer
+from .selftest import CheckResult, check_noffer
 
 if TYPE_CHECKING:
     from electrum.simple_config import SimpleConfig
@@ -569,8 +574,13 @@ class ClinkServer(Logger, EventListener):
         # Fold in the payer's requested memo only when this offer permits it;
         # otherwise the invoice carries just the merchant's label.
         description = protocol.effective_description(offer, req)
+        # Honor the payer's requested invoice expiry (clamped by protocol) — the
+        # same value gates the bolt11, the liquidity reservation and the
+        # receipt registry, so a request can't widen one window behind another's.
+        expiry_sec = protocol.effective_expiry_sec(req, self.invoice_expiry_sec)
         await self._issue_invoice(
-            event, offer, resolution.amount_sat, description, selftest=selftest)
+            event, offer, resolution.amount_sat, description,
+            expiry_sec=expiry_sec, selftest=selftest)
 
     def _record(self, offer_id: str, amount: Optional[int], result: str) -> None:
         # offer_id can originate from a hostile payer; keep the activity feed
@@ -582,8 +592,12 @@ class ClinkServer(Logger, EventListener):
 
     async def _issue_invoice(self, event: nEvent, offer, amount_sat: int,
                              description: Optional[str] = None, *,
+                             expiry_sec: Optional[int] = None,
                              selftest: bool = False) -> None:
-        expiry = self.invoice_expiry_sec
+        # The caller (dispatch) computes the effective expiry once from the
+        # request (payer's clamped expires_in_seconds, else our default) so the
+        # bolt11, reservation and receipt-registry windows all agree.
+        expiry = int(expiry_sec) if expiry_sec is not None else self.invoice_expiry_sec
         # Honor the payer's requested memo (NIP-69 description), combined with
         # the merchant's offer label, so the invoice carries who-it's-for context
         # (e.g. cashupayserver sends the store name). Capped/sanitized upstream.
@@ -680,8 +694,25 @@ class ClinkServer(Logger, EventListener):
 
     # --- payment receipts ------------------------------------------------
 
+    def _preimage_for(self, rhash: str) -> Optional[str]:
+        """The settlement preimage of a paid invoice, for its payment receipt.
+
+        Invoices we issued carry their preimage in the wallet's preimage store
+        from creation, so ``get_preimage_hex`` answers immediately on ``PR_PAID``.
+        Returns ``None`` (an "internal settlement" receipt, per the CLINK spec)
+        if the wallet or its lnworker is ever not ready.
+        """
+        try:
+            lnworker = getattr(self.wallet, "lnworker", None)
+            if lnworker is None:
+                return None
+            return lnworker.get_preimage_hex(rhash)
+        except Exception:
+            self.logger.exception(f"could not read preimage for {rhash[:10]}…")
+            return None
+
     async def _deliver_receipt(self, target: ReceiptTarget) -> bool:
-        """Publish the ``{"res":"ok"}`` receipt for a settled invoice.
+        """Publish the payment receipt for a settled invoice.
 
         Best-effort and idempotent: stamps the attempt first (so a failure waits
         a full retry interval), awaits the relay publish, and only on success
@@ -695,7 +726,8 @@ class ClinkServer(Logger, EventListener):
             await asyncio.wait_for(aionostr._add_event(
                 self.manager,
                 **self._encrypt_event_args(
-                    target.payer_pubkey, target.request_event_id, protocol.receipt_payload()),
+                    target.payer_pubkey, target.request_event_id,
+                    protocol.receipt_payload(target.preimage)),
             ), timeout=30)
         except Exception as e:
             self.logger.warning(
@@ -743,9 +775,10 @@ class ClinkServer(Logger, EventListener):
             return
         self.reserver.release(request.rhash)
         # A receipt is now owed to the payer of this CLINK invoice; persist that
-        # (mark_due) and fire a best-effort delivery on the asyncio loop. The
-        # entry stays owed until the relay accepts it, so a drop here is retried.
-        target = self.receipts.mark_due(request.rhash)
+        # (mark_due, capturing the settlement preimage now) and fire a
+        # best-effort delivery on the asyncio loop. The entry stays owed until
+        # the relay accepts it, so a drop here is retried.
+        target = self.receipts.mark_due(request.rhash, preimage=self._preimage_for(request.rhash))
         if target is not None:
             asyncio.run_coroutine_threadsafe(
                 self._deliver_receipt(target), get_asyncio_loop())
@@ -835,7 +868,7 @@ class ClinkServer(Logger, EventListener):
             except Exception as e:
                 self.logger.warning(f"dev-fee payout failed: {e!r}")
                 self.devfee.record_failure()
-                self._record("devfee", amount_sat, f"dev-fee payment failed")
+                self._record("devfee", amount_sat, "dev-fee payment failed")
                 return {"paid": False, "reason": f"payment failed: {e}"}
 
             if not success:
