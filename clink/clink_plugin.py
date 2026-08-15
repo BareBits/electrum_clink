@@ -63,7 +63,7 @@ from .relay_probe import (
     probe_relay_payable,
     select_payable_relay,
 )
-from .selftest import CheckResult, check_noffer
+from .selftest import SELFTEST_AMOUNT_SAT, CheckResult, check_noffer
 
 if TYPE_CHECKING:
     from electrum.simple_config import SimpleConfig
@@ -89,6 +89,32 @@ RELAY_CACHE_TTL_SEC = 24 * 60 * 60
 # Self-test payer identities expire after this long even if the checker never
 # unregistered them (crash safety) — comfortably above the check timeout.
 SELFTEST_PAYER_TTL_SEC = 120
+
+
+def _offer_price(price: Optional[int]) -> Optional[int]:
+    """Validate a fixed-offer price (sats); return it or raise.
+
+    ``None`` or ``0`` means "spontaneous offer" (the cmdline and Qt surfaces
+    both map an absent/zero input to ``None`` anyway). A fixed price must be a
+    positive integer within the bitcoin supply; anything else is rejected before
+    it can be stored, so a stored FIXED offer is always payable at a known amount.
+    """
+    if price is None or price == 0:
+        return None
+    if isinstance(price, bool) or not isinstance(price, int) or price < 1:
+        raise UserFacingException(
+            "Fixed offer price must be a positive integer amount in sats.")
+    if price > protocol.MAX_AMOUNT_SAT:
+        raise UserFacingException(
+            f"Fixed offer price exceeds the bitcoin supply cap "
+            f"({protocol.MAX_AMOUNT_SAT} sats).")
+    return price
+
+
+def _offer_price_type(price: Optional[int]) -> OfferPriceType:
+    # Validate through _offer_price so 0/None (spontaneous) and invalid input
+    # (raises) are classified identically everywhere.
+    return OfferPriceType.FIXED if _offer_price(price) is not None else OfferPriceType.SPONTANEOUS
 
 
 class ClinkServer(Logger, EventListener):
@@ -212,11 +238,15 @@ class ClinkServer(Logger, EventListener):
 
     def make_noffer(self, offer_id: str) -> str:
         """Build the noffer string a payer scans for ``offer_id``."""
+        offer = self.offers.get(offer_id)
         return noffer_encode(Noffer(
             pubkey=self.pubkey_hex,
-            relay=self.offer_relay(self.offers.get(offer_id)),
+            relay=self.offer_relay(offer),
             offer=offer_id,
-            price_type=OfferPriceType.SPONTANEOUS,
+            # Advertise the offer's own pricing so a payer sees the fixed price
+            # (TLV 4) and knows the amount is not negotiable before even asking.
+            price_type=offer.price_type if offer else OfferPriceType.SPONTANEOUS,
+            price=offer.price if offer else None,
         ))
 
     async def _liveness_probe(self, relay: str) -> ProbeResult:
@@ -400,8 +430,11 @@ class ClinkServer(Logger, EventListener):
         async def check_one(offer) -> None:
             # Test exactly the noffer string the table / QR shows for this offer.
             noffer_str = self.make_noffer(offer.offer_id)
+            # A fixed offer is only payable at its price; test it at that amount.
+            amount = offer.price if offer.price_type == OfferPriceType.FIXED else None
             result = await check_noffer(
                 noffer_str,
+                amount_sat=amount if amount is not None else SELFTEST_AMOUNT_SAT,
                 ssl_context=self.ssl_context,
                 proxy_factory=factory,
                 validate_bolt11=self._validate_selftest_bolt11,
@@ -934,17 +967,20 @@ class ClinkPlugin(BasePlugin):
     # --- API used by cmdline + Qt ----------------------------------------
 
     async def create_offer(self, label: str = "", allow_payer_memo: bool = True,
-                           relay: str = "") -> Dict[str, Any]:
+                           relay: str = "", price: Optional[int] = None) -> Dict[str, Any]:
         """Create an offer; ``relay`` (``wss://…``) pins a custom relay instead
-        of the automatic pick. Either way the relay is payability-probed first
-        and a failing probe *blocks* creation, and the chosen relay is pinned
-        onto the offer so the noffer handed to payers never changes across
-        restarts."""
+        of the automatic pick. ``price`` (positive sats) turns it into a fixed-
+        price offer whose noffer advertises TLV 3/4 and whose invoices are always
+        minted at exactly that amount; ``None`` keeps it spontaneous. Either way
+        the relay is payability-probed first and a failing probe *blocks*
+        creation, and the chosen relay is pinned onto the offer so the noffer
+        handed to payers never changes across restarts."""
         assert self.server is not None, "wallet not loaded yet"
         custom_relay = (relay or "").strip()
         if custom_relay:
             return await self._create_offer_custom_relay(
-                custom_relay, label=label, allow_payer_memo=allow_payer_memo)
+                custom_relay, label=label, allow_payer_memo=allow_payer_memo,
+                price=price)
         # Probe (cached 24h) before building the noffer so its single embedded
         # relay is one a payer can actually reach — see clink.relay_probe.
         selection = await self.server.pick_payable_relay()
@@ -960,19 +996,22 @@ class ClinkPlugin(BasePlugin):
         needs_listener = selection.relay not in self.server.listen_relay_urls()
         offer = self.server.offers.create(
             label=label, allow_payer_memo=allow_payer_memo,
+            price_type=_offer_price_type(price), price=_offer_price(price),
             relay=selection.relay, relay_custom=False)
         if needs_listener:
             self.server.restart_event_handler()
         return {
             "offer_id": offer.offer_id, "label": offer.label,
             "allow_payer_memo": offer.allow_payer_memo,
+            "price_type": int(offer.price_type), "price": offer.price,
             "noffer": self.server.make_noffer(offer.offer_id),
             "relay": offer.relay,
             "relay_payable": True,
         }
 
     async def _create_offer_custom_relay(self, relay: str, *, label: str,
-                                         allow_payer_memo: bool) -> Dict[str, Any]:
+                                         allow_payer_memo: bool,
+                                         price: Optional[int] = None) -> Dict[str, Any]:
         assert self.server is not None
         relay = normalize_relay_url(relay)  # ValueError on a malformed URL
         probe = await self.server.probe_custom_relay(relay)
@@ -985,13 +1024,15 @@ class ClinkPlugin(BasePlugin):
         # would never arrive; restart it only when the relay is actually new.
         needs_listener = relay not in self.server.listen_relay_urls()
         offer = self.server.offers.create(
-            label=label, allow_payer_memo=allow_payer_memo, relay=relay,
-            relay_custom=True)
+            label=label, allow_payer_memo=allow_payer_memo,
+            price_type=_offer_price_type(price), price=_offer_price(price),
+            relay=relay, relay_custom=True)
         if needs_listener:
             self.server.restart_event_handler()
         return {
             "offer_id": offer.offer_id, "label": offer.label,
             "allow_payer_memo": offer.allow_payer_memo,
+            "price_type": int(offer.price_type), "price": offer.price,
             "noffer": self.server.make_noffer(offer.offer_id),
             "relay": relay,
             "relay_payable": True,
@@ -1004,6 +1045,7 @@ class ClinkPlugin(BasePlugin):
             return {}
         return {o.offer_id: {"label": o.label, "active": o.active,
                              "allow_payer_memo": o.allow_payer_memo,
+                             "price_type": int(o.price_type), "price": o.price,
                              "noffer": self.server.make_noffer(o.offer_id),
                              "relay": self.server.offer_relay(o),
                              "relay_custom": o.relay_custom,

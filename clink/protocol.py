@@ -2,7 +2,7 @@
 
 The wire payloads (NIP-44-decrypted JSON) and the decision of *what* to reply are
 kept here, free of any relay or Electrum I/O, so the core policy — offer lookup,
-spontaneous-amount handling and the inbound-liquidity gate — is unit-testable.
+fixed/spontaneous amount handling and the inbound-liquidity gate — is unit-testable.
 
 Request  (payer -> us):  {"offer", "amount_sats"?, "zap"?, "payer_data"?, "expires_in_seconds"?, "description"?}
 Success  (us -> payer):  {"bolt11": "..."}
@@ -233,6 +233,22 @@ class SendError:
 Resolution = Union[IssueInvoice, SendError]
 
 
+def fixed_offer_price_sat(offer: Offer, min_sat: int = 1) -> Optional[int]:
+    """The payable sats amount of a FIXED offer, or ``None`` if misconfigured.
+
+    A fixed offer must advertise a positive integer price no larger than the
+    bitcoin supply; anything else (missing, float, bool, negative, zero) is a
+    broken offer that cannot be answered as-is. The caller answers such an
+    offer with an invalid-offer error.
+    """
+    price = getattr(offer, "price", None)
+    if isinstance(price, bool) or not isinstance(price, int):
+        return None
+    if not (min_sat <= price <= MAX_AMOUNT_SAT):
+        return None
+    return price
+
+
 def resolve_request(
     req: Dict[str, Any],
     offer: Optional[Offer],
@@ -248,10 +264,24 @@ def resolve_request(
     if offer is None or not offer.active:
         return SendError(error_payload(ERR_INVALID_OFFER, "Unknown or inactive offer"))
 
-    if offer.price_type != OfferPriceType.SPONTANEOUS:
-        # FIXED/VARIABLE are intentionally stubbed for v1.
+    if offer.price_type == OfferPriceType.FIXED:
+        # The merchant fixed the price; a payer may omit the amount (the spec
+        # makes it optional for fixed offers) but must not name a different one.
+        price = fixed_offer_price_sat(offer, min_sat)
+        if price is None:
+            return SendError(error_payload(ERR_INVALID_OFFER, "Unknown or inactive offer"))
+        requested = request_amount_sat(req)
+        if requested is not None and requested != price:
+            # Range collapses to the exact price: the offer is only payable at it.
+            return SendError(invalid_amount_payload(price, price))
+        if price > available_sat:
+            return SendError(invalid_amount_payload(price, price))
+        return IssueInvoice(price)
+
+    if offer.price_type == OfferPriceType.VARIABLE:
+        # VARIABLE needs a price oracle we don't have yet.
         return SendError(error_payload(
-            ERR_UNSUPPORTED_FEATURE, "Only spontaneous offers are supported"))
+            ERR_UNSUPPORTED_FEATURE, "Only fixed and spontaneous offers are supported"))
 
     amount = request_amount_sat(req)
     if amount is None or amount < min_sat:

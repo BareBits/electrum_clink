@@ -144,6 +144,68 @@ def test_absent_or_mistyped_expiry_falls_back_to_default() -> None:
     assert calls["issued"] == [(500, None, 120, False)] * 4
 
 
+# --- fixed-price offers --------------------------------------------------------
+
+def _fixed_dispatch_server() -> Tuple[Any, Dict[str, List[Any]]]:
+    """Like ``_dispatch_server`` but with a fixed-price offer (25000 sat)."""
+    from electrum.logging import Logger
+
+    from clink.noffer import OfferPriceType
+
+    server = ClinkServer.__new__(ClinkServer)
+    Logger.__init__(server)
+    server_sk = PrivateKey()
+    server.private_key = server_sk
+    server.pubkey_hex = server_sk.public_key.hex()
+    server._seen_events = OrderedDict()
+    server.recent_activity = deque(maxlen=50)
+    server._selftest_payers = {}
+    server.config = SimpleNamespace(CLINK_INVOICE_EXPIRY=120)
+    offer = Offer(offer_id="o1", label="L",
+                  price_type=OfferPriceType.FIXED, price=25000)
+    server.offers = SimpleNamespace(get=lambda oid: offer if oid == "o1" else None)
+    server.reserver = SimpleNamespace(available_sat=lambda: 100_000)
+    server.receipts = SimpleNamespace(pending_count_for=lambda pub: 0)
+
+    calls: Dict[str, List[Any]] = {"responses": [], "issued": []}
+
+    async def send_response(event: Any, payload: Dict[str, Any]) -> None:
+        calls["responses"].append(payload)
+
+    async def issue_invoice(event: Any, offer: Any, amount_sat: int,
+                            description: Optional[str] = None, *,
+                            expiry_sec: Optional[int] = None,
+                            selftest: bool = False) -> None:
+        calls["issued"].append((amount_sat, description, expiry_sec, selftest))
+
+    server.send_response = send_response  # type: ignore[method-assign]
+    server._issue_invoice = issue_invoice  # type: ignore[method-assign]
+    return server, calls
+
+
+def test_fixed_offer_issues_invoice_at_price_without_amount() -> None:
+    server, calls = _fixed_dispatch_server()
+    # The spec makes amount_sats optional for a fixed offer.
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1"}))
+    assert calls["issued"] == [(25000, None, 120, False)]
+    assert calls["responses"] == []
+
+
+def test_fixed_offer_issues_invoice_at_matching_amount() -> None:
+    server, calls = _fixed_dispatch_server()
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1", "amount_sats": 25000}))
+    assert calls["issued"] == [(25000, None, 120, False)]
+
+
+def test_fixed_offer_rejects_differing_amount_at_dispatch() -> None:
+    server, calls = _fixed_dispatch_server()
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1", "amount_sats": 1}))
+    assert calls["issued"] == []
+    assert calls["responses"] == [{
+        "code": protocol.ERR_INVALID_AMOUNT, "error": "Invalid Amount",
+        "range": {"min": 25000, "max": 25000}}]
+
+
 # --- freshness clamps ---------------------------------------------------------
 
 def test_stale_request_dropped() -> None:

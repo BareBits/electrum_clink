@@ -83,9 +83,53 @@ def test_zero_or_negative_amount() -> None:
         assert res.payload["code"] == ERR_INVALID_AMOUNT
 
 
-def test_fixed_offer_unsupported_in_v1() -> None:
+def test_fixed_offer_invoice_at_advertised_price() -> None:
+    # The spec makes amount_sats optional for a fixed offer; absent -> price.
+    res = resolve_request({}, _offer(price_type=OfferPriceType.FIXED, price=25000),
+                          available_sat=100_000)
+    assert isinstance(res, IssueInvoice) and res.amount_sat == 25000
+
+
+def test_fixed_offer_accepts_matching_amount() -> None:
+    res = resolve_request({"amount_sats": 25000},
+                          _offer(price_type=OfferPriceType.FIXED, price=25000),
+                          available_sat=100_000)
+    assert isinstance(res, IssueInvoice) and res.amount_sat == 25000
+
+
+def test_fixed_offer_rejects_differing_amount() -> None:
+    for amt in (24999, 25001, 1):
+        res = resolve_request({"amount_sats": amt},
+                              _offer(price_type=OfferPriceType.FIXED, price=25000),
+                              available_sat=100_000)
+        assert isinstance(res, SendError) and res.payload["code"] == ERR_INVALID_AMOUNT
+        # The acceptable range collapses to the exact fixed price.
+        assert res.payload["range"] == {"min": 25000, "max": 25000}
+
+
+def test_fixed_offer_price_must_be_positive_int() -> None:
+    for price in (None, 0, -5, 25000.0, True, "25000"):
+        res = resolve_request({}, _offer(price_type=OfferPriceType.FIXED, price=price),
+                              available_sat=100_000)
+        assert isinstance(res, SendError) and res.payload["code"] == ERR_INVALID_OFFER
+
+
+def test_fixed_offer_price_over_supply_cap_is_invalid() -> None:
+    res = resolve_request({}, _offer(price_type=OfferPriceType.FIXED, price=MAX_AMOUNT_SAT + 1),
+                          available_sat=10 ** 12)
+    assert isinstance(res, SendError) and res.payload["code"] == ERR_INVALID_OFFER
+
+
+def test_fixed_offer_price_exceeds_liquidity() -> None:
+    res = resolve_request({}, _offer(price_type=OfferPriceType.FIXED, price=25000),
+                          available_sat=20000)
+    assert isinstance(res, SendError) and res.payload["code"] == ERR_INVALID_AMOUNT
+    assert res.payload["range"] == {"min": 25000, "max": 25000}
+
+
+def test_variable_offer_still_unsupported() -> None:
     res = resolve_request({"amount_sats": 1000},
-                          _offer(price_type=OfferPriceType.FIXED, price=1000),
+                          _offer(price_type=OfferPriceType.VARIABLE, price=1),
                           available_sat=100_000)
     assert isinstance(res, SendError)
     assert res.payload["code"] == ERR_UNSUPPORTED_FEATURE

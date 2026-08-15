@@ -193,6 +193,34 @@ def test_create_offer_pins_probed_relay() -> None:
     assert noffer_decode(result["noffer"]).relay == PICKED
 
 
+def test_create_fixed_price_offer_advertises_price_in_noffer() -> None:
+    from clink.noffer import OfferPriceType, noffer_decode
+
+    plugin, server, _events = _plugin(_selection(ok=True))
+    result = _run(plugin.create_offer(label="coffee", price=25000))
+    offer = server.offers.get(result["offer_id"])
+    assert offer is not None
+    assert offer.price_type == OfferPriceType.FIXED
+    assert offer.price == 25000
+    assert result["price_type"] == 0 and result["price"] == 25000
+    decoded = noffer_decode(result["noffer"])
+    assert decoded.price_type == OfferPriceType.FIXED
+    assert decoded.price == 25000
+
+
+def test_create_offer_price_validation() -> None:
+    plugin, server, _events = _plugin(_selection(ok=True))
+    for price in (-5, 1.5, True):
+        with pytest.raises(UserFacingException, match="price"):
+            _run(plugin.create_offer(label="x", price=price))
+    assert server.offers.list() == []
+    # 0 / omitted is still a spontaneous offer.
+    for price in (0, None):
+        result = _run(plugin.create_offer(label="x", price=price))
+        assert result["price_type"] == 2 and result["price"] is None
+    assert len(server.offers.list()) == 2
+
+
 def test_create_offer_blocks_when_no_relay_is_payable() -> None:
     plugin, server, _events = _plugin(_selection(ok=False, relay=FALLBACK))
     with pytest.raises(UserFacingException, match="not created"):
