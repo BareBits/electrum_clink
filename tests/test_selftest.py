@@ -22,20 +22,19 @@ import asyncio
 import json
 import time
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from electrum_aionostr.key import PrivateKey
 
 from clink import nip44
 from clink.noffer import Noffer, OfferPriceType, noffer_encode
 from clink.selftest import (
+    SELFTEST_AMOUNT_SAT,
     CheckResult,
     CheckStatus,
-    SELFTEST_AMOUNT_SAT,
     _run_check,
     check_noffer,
 )
-
 
 # --- fakes -----------------------------------------------------------------
 
@@ -289,6 +288,7 @@ def _bare_server():
     collaborators the method under test touches.
     """
     from electrum.logging import Logger
+
     from clink.clink_plugin import ClinkServer
 
     server = ClinkServer.__new__(ClinkServer)

@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import electrum_aionostr as aionostr
 from electrum_aionostr.key import PrivateKey
