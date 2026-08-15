@@ -33,7 +33,6 @@ from clink.clink_plugin import ClinkPlugin, ClinkServer
 from clink.offers import OfferStore
 from clink.relay_probe import ProbeResult, ProbeStatus, RelaySelection
 
-
 PICKED = "wss://picked.example"
 FALLBACK = "wss://first-in-config.example"
 

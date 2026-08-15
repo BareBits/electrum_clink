@@ -38,7 +38,6 @@ from clink.clink_plugin import (
 )
 from clink.offers import Offer
 
-
 # --- harness -----------------------------------------------------------------
 
 def _dispatch_server() -> Tuple[Any, Dict[str, List[Any]]]:
@@ -238,6 +237,7 @@ def test_selftest_payer_bypasses_cap() -> None:
 def test_invoice_failure_reply_is_generic() -> None:
     """A wallet-side exception must not leak its text to the payer."""
     from electrum.logging import Logger
+
     from clink.liquidity import LiquidityReserver
 
     server = ClinkServer.__new__(ClinkServer)

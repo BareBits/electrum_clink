@@ -17,13 +17,7 @@ from collections import OrderedDict, deque
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 import electrum_aionostr as aionostr
-from electrum_aionostr.event import Event as nEvent
-from electrum_aionostr.key import PrivateKey
-
-from electrum.logging import Logger
-from electrum.plugin import BasePlugin, hook
 from electrum.invoices import PR_EXPIRED, PR_PAID, PR_UNPAID, Invoice, Request
-from electrum.lnutil import RECEIVED
 from electrum.lnurl import (
     LNURL6Data,
     LNURLError,
@@ -32,6 +26,9 @@ from electrum.lnurl import (
     lightning_address_to_url,
     request_lnurl,
 )
+from electrum.lnutil import RECEIVED
+from electrum.logging import Logger
+from electrum.plugin import BasePlugin, hook
 from electrum.util import (
     EventListener,
     OldTaskGroup,
@@ -43,13 +40,21 @@ from electrum.util import (
     log_exceptions,
     make_aiohttp_proxy_connector,
 )
+from electrum_aionostr.event import Event as nEvent
+from electrum_aionostr.key import PrivateKey
 
 from . import nip44, protocol
 from .devfee import MIN_PAYOUT_SAT, DevFeeLedger
 from .liquidity import LiquidityReserver, receivable_capacity_sat
 from .liveness import LivenessResult, RelayLivenessMonitor
 from .noffer import Noffer, OfferPriceType, noffer_encode
-from .offers import Offer, OfferStore, advertised_relay, advertised_relays, listen_relays
+from .offers import (
+    Offer,
+    OfferStore,
+    advertised_relay,
+    advertised_relays,
+    listen_relays,
+)
 from .receipts import RETRY_INTERVAL_SEC, ReceiptRegistry, ReceiptTarget
 from .relay_probe import (
     ProbeResult,
@@ -58,7 +63,7 @@ from .relay_probe import (
     probe_relay_payable,
     select_payable_relay,
 )
-from .selftest import CheckResult, CheckStatus, check_noffer
+from .selftest import CheckResult, check_noffer
 
 if TYPE_CHECKING:
     from electrum.simple_config import SimpleConfig
@@ -835,7 +840,7 @@ class ClinkServer(Logger, EventListener):
             except Exception as e:
                 self.logger.warning(f"dev-fee payout failed: {e!r}")
                 self.devfee.record_failure()
-                self._record("devfee", amount_sat, f"dev-fee payment failed")
+                self._record("devfee", amount_sat, "dev-fee payment failed")
                 return {"paid": False, "reason": f"payment failed: {e}"}
 
             if not success:

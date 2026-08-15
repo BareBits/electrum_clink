@@ -13,7 +13,7 @@ dict.
 from __future__ import annotations
 
 import secrets
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional
 
 from .noffer import OfferPriceType
