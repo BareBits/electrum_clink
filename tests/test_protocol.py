@@ -92,9 +92,16 @@ def test_exact_available_is_allowed() -> None:
     assert isinstance(res, IssueInvoice)
 
 
-def test_receipt_payload_is_sdk_shape() -> None:
-    # The reference @shocknet/clink-sdk NofferReceipt type is exactly {res: 'ok'}.
+def test_receipt_payload_without_preimage_is_internal_settlement() -> None:
+    # No preimage -> an "internal settlement" acknowledgment; this is also the
+    # reference @shocknet/clink-sdk NofferReceipt shape ({res: 'ok'}).
     assert receipt_payload() == {"res": "ok"}
+    assert receipt_payload(None) == {"res": "ok"}
+
+
+def test_receipt_payload_with_preimage() -> None:
+    preimage = "ab" * 32
+    assert receipt_payload(preimage) == {"res": "ok", "preimage": preimage}
 
 
 # ---- request field validation (attacker-controlled input) ----

@@ -12,23 +12,43 @@ import math
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional, Tuple
 
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QPixmap, QImage
-from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
-    QScrollArea, QSlider, QSpinBox, QTextEdit, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+from electrum.gui.common_qt.util import paintQR
+from electrum.gui.qt.util import (
+    Buttons,
+    CancelButton,
+    CloseButton,
+    ColorScheme,
+    OkButton,
+    WindowModalDialog,
+    read_QIcon,
 )
-
 from electrum.i18n import _
 from electrum.plugin import hook
 from electrum.util import UserCancelled, get_asyncio_loop
-from electrum.gui.qt.util import (
-    Buttons, CancelButton, CloseButton, ColorScheme, OkButton, WindowModalDialog,
-    read_QIcon,
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QSpinBox,
+    QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
-from electrum.gui.common_qt.util import paintQR
 
 from . import protocol
 from .clink_plugin import ClinkPlugin
@@ -96,8 +116,8 @@ GROW_TARGET_W = 1000
 GROW_TARGET_H = 760
 
 if TYPE_CHECKING:
-    from electrum.wallet import Abstract_Wallet
     from electrum.gui.qt.main_window import ElectrumWindow
+    from electrum.wallet import Abstract_Wallet
 
 
 class Plugin(ClinkPlugin):
