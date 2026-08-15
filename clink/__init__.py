@@ -76,6 +76,16 @@ SimpleConfig.CLINK_INVOICE_EXPIRY = ConfigVar(
     plugin=plugin_name,
 )
 
+# Whether the plugin advertises its default offer's noffer in a kind-0 metadata
+# event (NIP-01 user metadata; spec "Integration with Nostr"), so profiles and
+# directories can surface a CLINK payment entry point. Opt-out.
+SimpleConfig.CLINK_ADVERTISE_METADATA = ConfigVar(
+    key="plugins.clink.advertise_metadata",
+    default=True,
+    type_=bool,
+    plugin=plugin_name,
+)
+
 # --- Dev fee -------------------------------------------------------------
 # An optional, opt-out contribution that funds further plugin development. It
 # accrues as a small fraction of inbound payments answered through CLINK offers
@@ -155,6 +165,26 @@ async def list_offers(self: "Commands", plugin: "ClinkPlugin" = None) -> dict:
     List all offers with their noffer strings.
     """
     return plugin.list_offers()
+
+
+@plugin_command("", plugin_name)
+async def advertise_offer(self: "Commands", plugin: "ClinkPlugin" = None) -> dict:
+    """
+    Reconcile the kind-0 metadata advertisement now: fetch the identity's
+    current metadata event, set its clink_offer field to the default offer's
+    noffer (preserving every other profile field), and republish only when it
+    changed. Returns {enabled, offer_id, noffer, published}.
+    """
+    return await plugin.advertise()
+
+
+@plugin_command("", plugin_name)
+async def metadata_status(self: "Commands", plugin: "ClinkPlugin" = None) -> dict:
+    """
+    Show what the kind-0 metadata advertisement would advertise for the current
+    offer set (no network I/O). Returns {enabled, offer_id, noffer}.
+    """
+    return plugin.metadata_status()
 
 
 @plugin_command("", plugin_name)

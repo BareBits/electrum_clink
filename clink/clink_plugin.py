@@ -47,6 +47,7 @@ from . import nip44, protocol
 from .devfee import MIN_PAYOUT_SAT, DevFeeLedger
 from .liquidity import LiquidityReserver, receivable_capacity_sat
 from .liveness import LivenessResult, RelayLivenessMonitor
+from .metadata import default_offer, merge_clink_offer
 from .noffer import Noffer, OfferPriceType, noffer_encode
 from .offers import (
     Offer,
@@ -233,6 +234,12 @@ class ClinkServer(Logger, EventListener):
     @property
     def invoice_expiry_sec(self) -> int:
         return int(self.config.CLINK_INVOICE_EXPIRY)  # type: ignore[attr-defined]
+
+    @property
+    def advertise_metadata(self) -> bool:
+        # Opt-out: publish the default offer's noffer in kind-0 metadata so
+        # profiles/directories can surface a CLINK payment entry point.
+        return bool(self.config.CLINK_ADVERTISE_METADATA)  # type: ignore[attr-defined]
 
     def offer_relay(self, offer: Optional[Offer]) -> str:
         """The relay ``offer``'s noffer advertises (its pinned relay, or the
@@ -516,6 +523,7 @@ class ClinkServer(Logger, EventListener):
                     await tg.spawn(self.handle_requests())
                     await tg.spawn(self._devfee_startup_check())
                     await tg.spawn(self._redeliver_receipts())
+                    await tg.spawn(self.sync_metadata())
             except asyncio.CancelledError:
                 if self.do_stop:
                     return
@@ -735,6 +743,80 @@ class ClinkServer(Logger, EventListener):
             self.manager,
             **self._encrypt_event_args(request_event.pubkey, request_event.id, payload),
         ))
+
+    # --- kind-0 metadata advertising (clink_offer) ------------------------
+
+    async def _fetch_metadata_content(self) -> Optional[str]:
+        """The newest kind-0 content string published for our identity.
+
+        Several relays may each answer with a stored event; the latest
+        ``created_at`` wins. ``None`` when no relay has any metadata for us.
+        """
+        newest: Optional[nEvent] = None
+        async for ev in self.manager.get_events(
+                {"kinds": [0], "authors": [self.pubkey_hex], "limit": 1},
+                only_stored=True):
+            if newest is None or ev.created_at > newest.created_at:
+                newest = ev
+        return newest.content if newest is not None else None
+
+    async def _publish_metadata_content(self, content: str) -> None:
+        """Publish a signed kind-0 event to every connected relay."""
+        await aionostr._add_event(
+            self.manager, kind=0, content=content, tags=[],
+            private_key=self.private_key.hex())
+
+    async def sync_metadata(self) -> bool:
+        """Reconcile the kind-0 ``clink_offer`` field with the default offer.
+
+        Fetches our current metadata, merges the default offer's noffer in
+        (preserving every other profile field), and republishes only when the
+        content actually changed — so a connected relay is never spammed with
+        identical events. Returns True when a publish happened. Safe to call
+        any time: no-ops while the manager is down, metadata advertising is
+        disabled, or there is nothing to advertise yet.
+        """
+        if self.manager is None or not self.advertise_metadata:
+            return False
+        default = default_offer(self.offers.list())
+        noffer = self.make_noffer(default.offer_id) if default else None
+        try:
+            existing = await self._fetch_metadata_content()
+        except Exception:
+            self.logger.debug("could not fetch clink metadata", exc_info=True)
+            return False
+        target = merge_clink_offer(existing, noffer)
+        if target == existing:
+            return False
+        if not noffer and not (existing or "").strip():
+            return False
+        try:
+            await self._publish_metadata_content(target)
+        except Exception:
+            self.logger.exception("could not publish clink metadata")
+            return False
+        self.logger.info(
+            "advertised clink offer in kind-0 metadata"
+            + (f" ({default.offer_id})" if default else " (removed)"))
+        return True
+
+    def _schedule_metadata_sync(self) -> None:
+        """Fire ``sync_metadata`` onto the asyncio loop, if one is running.
+
+        Called from the plugin API (cmdline/Qt thread) after an offer mutation
+        changes which noffer is the default, so the advertisement follows the
+        offer without blocking the caller on a relay round trip.
+        """
+        try:
+            loop = get_asyncio_loop()
+        except Exception:
+            return
+        if loop is None or not loop.is_running():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self.sync_metadata(), loop)
+        except Exception:
+            self.logger.debug("could not schedule clink metadata sync", exc_info=True)
 
     def _delete_stale_request(self, rhash: str) -> None:
         """Garbage-collect the wallet request behind a dropped registry entry.
@@ -1033,6 +1115,7 @@ class ClinkPlugin(BasePlugin):
             expires_at=_offer_expires_at(expires_in))
         if needs_listener:
             self.server.restart_event_handler()
+        self.server._schedule_metadata_sync()
         return {
             "offer_id": offer.offer_id, "label": offer.label,
             "allow_payer_memo": offer.allow_payer_memo,
@@ -1065,6 +1148,7 @@ class ClinkPlugin(BasePlugin):
             expires_at=_offer_expires_at(expires_in))
         if needs_listener:
             self.server.restart_event_handler()
+        self.server._schedule_metadata_sync()
         return {
             "offer_id": offer.offer_id, "label": offer.label,
             "allow_payer_memo": offer.allow_payer_memo,
@@ -1099,6 +1183,34 @@ class ClinkPlugin(BasePlugin):
             return []
         return self.server.candidate_relays()
 
+    async def advertise(self) -> Dict[str, Any]:
+        """Reconcile the kind-0 ``clink_offer`` advertisement right now.
+
+        Returns the outcome plus the advertised (or to-be-advertised) noffer so
+        callers can tell a fresh publish from an already-correct one.
+        """
+        assert self.server is not None, "wallet not loaded yet"
+        published = await self.server.sync_metadata()
+        status = self.metadata_status()
+        status["published"] = bool(published)
+        return status
+
+    def metadata_status(self) -> Dict[str, Any]:
+        """The current default-offer advertisement (no network I/O).
+
+        ``offer_id``/``noffer`` are what kind-0 metadata should advertise for
+        the live offer set; ``enabled`` reflects the advertising config.
+        """
+        if self.server is None:
+            return {"enabled": bool(self.config.CLINK_ADVERTISE_METADATA),
+                    "offer_id": None, "noffer": None}
+        default = default_offer(self.server.offers.list())
+        return {
+            "enabled": self.server.advertise_metadata,
+            "offer_id": default.offer_id if default else None,
+            "noffer": self.server.make_noffer(default.offer_id) if default else None,
+        }
+
     def set_offer_label(self, offer_id: str, label: str) -> bool:
         assert self.server is not None, "wallet not loaded yet"
         return self.server.offers.set_label(offer_id, label)
@@ -1114,6 +1226,8 @@ class ClinkPlugin(BasePlugin):
         # Drop the listener connection to a custom relay no other offer needs.
         if removed and set(self.server.listen_relay_urls()) != before:
             self.server.restart_event_handler()
+        if removed:
+            self.server._schedule_metadata_sync()
         return removed
 
     def replace_offer(self, offer_id: str, replacement_id: str) -> bool:
@@ -1124,7 +1238,9 @@ class ClinkPlugin(BasePlugin):
         assert self.server is not None, "wallet not loaded yet"
         if not self.server.offers.replace_with(offer_id, replacement_id):
             return False
-        return self.server.offers.set_active(offer_id, False)
+        ok = self.server.offers.set_active(offer_id, False)
+        self.server._schedule_metadata_sync()
+        return ok
 
     async def check_noffers(self, offer_id: Optional[str] = None) -> Dict[str, Any]:
         """Self-test the noffer of one offer (or all offers) end to end.

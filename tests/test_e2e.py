@@ -25,7 +25,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Optional
 
 import pytest
 
@@ -339,6 +339,54 @@ def test_bool_amount_gets_invalid_amount_error(rig) -> None:
         noffer, amount_sats=None, timeout=30,
         payload_override={"offer": offer_id, "amount_sats": True}))
     assert resp.get("code") == 5, resp
+
+
+def _fetch_kind0(relay: str, author: str) -> Optional[Dict[str, Any]]:
+    """The newest kind-0 content dict a relay stores for ``author``, or None."""
+    import electrum_aionostr as aionostr
+    from electrum_aionostr.key import PrivateKey
+
+    sk = PrivateKey()
+
+    async def _run() -> Optional[Dict[str, Any]]:
+        manager = aionostr.Manager(relays=[relay], private_key=sk.hex())
+        await manager.connect()
+        try:
+            newest = None
+            async for ev in manager.get_events(
+                    {"kinds": [0], "authors": [author], "limit": 1}, only_stored=True):
+                if newest is None or ev.created_at > newest.created_at:
+                    newest = ev
+            if newest is None:
+                return None
+            parsed = json.loads(newest.content)
+            return parsed if isinstance(parsed, dict) else None
+        finally:
+            await manager.close()
+
+    return asyncio.run(_run())
+
+
+def test_kind0_metadata_advertises_default_offer(rig) -> None:
+    """The plugin publishes a kind-0 metadata event whose ``clink_offer`` field
+    carries the default offer's noffer on the relay that noffer advertises, so
+    profiles/directories can surface a CLINK payment entry point (spec
+    "Integration with Nostr")."""
+    from clink.noffer import noffer_decode
+
+    created = json.loads(_electrum_cli("clink_add_offer", "--label", "e2e"))
+    result = json.loads(_electrum_cli("clink_advertise_offer"))
+    assert result["published"] is True, result
+    assert result["offer_id"] == created["offer_id"], result
+    assert result["noffer"] == created["noffer"], result
+
+    decoded = noffer_decode(created["noffer"])
+    metadata = _fetch_kind0(decoded.relay, decoded.pubkey)
+    assert metadata is not None, "no kind-0 metadata on the rig relay"
+    assert metadata.get("clink_offer") == created["noffer"], metadata
+    # Re-advertising is idempotent: the relay already carries the right value.
+    again = json.loads(_electrum_cli("clink_advertise_offer"))
+    assert again["published"] is False, again
 
 
 def test_issued_invoice_locks_liquidity(rig) -> None:
