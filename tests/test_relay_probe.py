@@ -29,7 +29,6 @@ from clink.relay_probe import (
     select_payable_relay,
 )
 
-
 # --- normalize_relay_url: user-supplied relay validation ------------------
 
 @pytest.mark.parametrize("url", [

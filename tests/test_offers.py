@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from clink.noffer import OfferPriceType
 from clink.offers import (
-    Offer, OfferStore, advertised_relay, advertised_relays, listen_relays,
+    Offer,
+    OfferStore,
+    advertised_relay,
+    advertised_relays,
+    listen_relays,
 )
 
 
@@ -232,3 +236,68 @@ def test_listen_relays_skips_default_once_all_offers_pinned() -> None:
     offers.append(Offer(offer_id="c"))
     assert listen_relays(offers, "wss://auto.example") == [
         "wss://auto.example", "wss://one.example", "wss://two.example"]
+
+
+# --- offer expiry and replacement (code-3 "latest" support) --------------
+
+def test_expires_at_defaults_to_never() -> None:
+    store = OfferStore({})
+    assert store.create().expires_at == 0
+    assert Offer.from_dict({"offer_id": "abc"}).expires_at == 0
+
+
+def test_set_expires_at_persists() -> None:
+    storage: dict = {}
+    store = OfferStore(storage)
+    o = store.create()
+    assert store.set_expires_at(o.offer_id, 1_700_000_000)
+    assert store.get(o.offer_id).expires_at == 1_700_000_000
+    assert OfferStore(storage).get(o.offer_id).expires_at == 1_700_000_000
+    assert not store.set_expires_at("nonexistent", 1_700_000_000)
+
+
+def test_expires_at_round_trips_through_dict() -> None:
+    o = Offer.from_dict(Offer(offer_id="x", expires_at=1_700_000_000).to_dict())
+    assert o.expires_at == 1_700_000_000
+
+
+def test_replaced_by_defaults_to_empty() -> None:
+    assert OfferStore({}).create().replaced_by == ""
+    assert Offer.from_dict({"offer_id": "abc"}).replaced_by == ""
+
+
+def test_set_replaced_by_persists() -> None:
+    storage: dict = {}
+    store = OfferStore(storage)
+    o = store.create()
+    assert store.set_replaced_by(o.offer_id, "new-id")
+    assert OfferStore(storage).get(o.offer_id).replaced_by == "new-id"
+    assert not store.set_replaced_by("nonexistent", "new-id")
+
+
+def test_set_replaced_by_strips_and_clears() -> None:
+    store = OfferStore({})
+    o = store.create()
+    assert store.set_replaced_by(o.offer_id, "  new-id  ")
+    assert store.get(o.offer_id).replaced_by == "new-id"
+    assert store.set_replaced_by(o.offer_id, "")
+    assert store.get(o.offer_id).replaced_by == ""
+
+
+def test_replaced_by_round_trips_through_dict() -> None:
+    o = Offer.from_dict(Offer(offer_id="x", replaced_by="new-id").to_dict())
+    assert o.replaced_by == "new-id"
+
+
+def test_replace_with_links_outgoing_to_replacement() -> None:
+    storage: dict = {}
+    store = OfferStore(storage)
+    old = store.create(label="old")
+    new = store.create(label="new")
+    assert store.replace_with(old.offer_id, new.offer_id)
+    assert OfferStore(storage).get(old.offer_id).replaced_by == new.offer_id
+    # replacement offer is untouched
+    assert OfferStore(storage).get(new.offer_id).replaced_by == ""
+    # both must exist
+    assert not store.replace_with("ghost", new.offer_id)
+    assert not store.replace_with(old.offer_id, "ghost")

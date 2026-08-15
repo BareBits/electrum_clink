@@ -33,7 +33,6 @@ from clink.clink_plugin import ClinkPlugin, ClinkServer
 from clink.offers import OfferStore
 from clink.relay_probe import ProbeResult, ProbeStatus, RelaySelection
 
-
 PICKED = "wss://picked.example"
 FALLBACK = "wss://first-in-config.example"
 
@@ -194,6 +193,34 @@ def test_create_offer_pins_probed_relay() -> None:
     assert noffer_decode(result["noffer"]).relay == PICKED
 
 
+def test_create_fixed_price_offer_advertises_price_in_noffer() -> None:
+    from clink.noffer import OfferPriceType, noffer_decode
+
+    plugin, server, _events = _plugin(_selection(ok=True))
+    result = _run(plugin.create_offer(label="coffee", price=25000))
+    offer = server.offers.get(result["offer_id"])
+    assert offer is not None
+    assert offer.price_type == OfferPriceType.FIXED
+    assert offer.price == 25000
+    assert result["price_type"] == 0 and result["price"] == 25000
+    decoded = noffer_decode(result["noffer"])
+    assert decoded.price_type == OfferPriceType.FIXED
+    assert decoded.price == 25000
+
+
+def test_create_offer_price_validation() -> None:
+    plugin, server, _events = _plugin(_selection(ok=True))
+    for price in (-5, 1.5, True):
+        with pytest.raises(UserFacingException, match="price"):
+            _run(plugin.create_offer(label="x", price=price))
+    assert server.offers.list() == []
+    # 0 / omitted is still a spontaneous offer.
+    for price in (0, None):
+        result = _run(plugin.create_offer(label="x", price=price))
+        assert result["price_type"] == 2 and result["price"] is None
+    assert len(server.offers.list()) == 2
+
+
 def test_create_offer_blocks_when_no_relay_is_payable() -> None:
     plugin, server, _events = _plugin(_selection(ok=False, relay=FALLBACK))
     with pytest.raises(UserFacingException, match="not created"):
@@ -222,3 +249,45 @@ def test_pinned_relay_survives_selection_loss() -> None:
     assert listed["relay_pinned"] is True
     assert listed["relay_custom"] is False
     assert listed["noffer"] == result["noffer"]
+
+
+# --- offer expiry and replacement --------------------------------------------
+
+def test_create_offer_without_expiry_never_expires() -> None:
+    plugin, server, _events = _plugin(_selection(ok=True))
+    for kw in ({}, {"expires_in": 0}, {"expires_in": None}):
+        result = _run(plugin.create_offer(label="x", **kw))
+        assert result["expires_at"] == 0
+        assert server.offers.get(result["offer_id"]).expires_at == 0
+
+
+def test_create_offer_with_expiry_sets_absolute_expires_at() -> None:
+    plugin, server, _events = _plugin(_selection(ok=True))
+    before = time.time()
+    result = _run(plugin.create_offer(label="x", expires_in=3600))
+    assert server.offers.get(result["offer_id"]).expires_at == result["expires_at"]
+    assert result["expires_at"] >= int(before) + 3600
+    # the offer's expiry is persisted, not just reported
+    assert result["expires_at"] == plugin.list_offers()[result["offer_id"]]["expires_at"]
+
+
+def test_create_offer_expiry_validation() -> None:
+    plugin, server, _events = _plugin(_selection(ok=True))
+    for bad in (-5, 0.5, True, "3600"):
+        with pytest.raises(UserFacingException, match="expiry"):
+            _run(plugin.create_offer(label="x", expires_in=bad))
+    assert server.offers.list() == []
+
+
+def test_replace_offer_retires_old_and_links_to_new() -> None:
+    plugin, server, _events = _plugin(_selection(ok=True))
+    old = server.offers.create(label="old")
+    new = server.offers.create(label="new")
+    assert plugin.replace_offer(old.offer_id, new.offer_id) is True
+    listed = plugin.list_offers()
+    assert listed[old.offer_id]["active"] is False
+    assert listed[old.offer_id]["replaced_by"] == new.offer_id
+    assert listed[new.offer_id]["active"] is True
+    assert listed[new.offer_id]["replaced_by"] == ""
+    assert plugin.replace_offer("ghost", new.offer_id) is False
+    assert plugin.replace_offer(old.offer_id, "ghost") is False
