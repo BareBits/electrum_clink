@@ -54,6 +54,8 @@ class ReceiptTarget:
     attempts: int = 0
     due_since: float = 0.0
     preimage: Optional[str] = None
+    zap: Optional[str] = None
+    bolt11: Optional[str] = None
 
 
 class ReceiptRegistry:
@@ -92,16 +94,23 @@ class ReceiptRegistry:
             attempts=int(entry.get("attempts", 0)),
             due_since=float(entry.get("due_since", 0.0)),
             preimage=entry.get("preimage"),
+            zap=entry.get("zap"),
+            bolt11=entry.get("bolt11"),
         )
 
     # --- lifecycle -------------------------------------------------------
 
     def remember(self, rhash: str, payer_pubkey: str, request_event_id: str,
-                 expires_at: float) -> List[str]:
+                 expires_at: float, *, zap: Optional[str] = None,
+                 bolt11: Optional[str] = None) -> List[str]:
         """Record that an invoice was issued; a receipt may later be owed.
 
         ``expires_at`` is the invoice's own expiry: if the invoice is never paid,
         :meth:`sweep` drops the entry once this passes (no receipt is ever owed).
+
+        ``zap``/``bolt11`` carry the context of a NIP-57 zap: the payer's
+        stringified kind-9734 request and the issued invoice string, so the
+        kind-9735 receipt can be built and published after settlement.
 
         Returns the payment hashes of any awaiting-payment entries evicted to
         stay under :data:`MAX_PENDING`, so the caller can garbage-collect their
@@ -109,7 +118,7 @@ class ReceiptRegistry:
         request behind.
         """
         entries = self._load()
-        entries[rhash] = {
+        entry: Dict[str, Any] = {
             "payer": payer_pubkey,
             "req": request_event_id,
             "expires_at": float(expires_at),
@@ -118,6 +127,11 @@ class ReceiptRegistry:
             "attempts": 0,
             "last_attempt": 0.0,
         }
+        if zap is not None:
+            entry["zap"] = zap
+        if bolt11 is not None:
+            entry["bolt11"] = bolt11
+        entries[rhash] = entry
         evicted = self._enforce_cap(entries)
         self._save(entries)
         return evicted

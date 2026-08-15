@@ -25,7 +25,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import pytest
 
@@ -293,6 +293,87 @@ def test_payment_receipt_delivered_after_payment(rig) -> None:
     assert result["invoice"]["bolt11"].lower().startswith("lnbcrt")
     assert result["receipt"]["res"] == "ok", result
     assert re.fullmatch(r"[0-9a-f]{64}", result["receipt"]["preimage"]), result
+
+
+def _fetch_zap_receipts(relay: str, author: str) -> List[Any]:
+    """The kind-9735 zap receipts a relay stores, authored by ``author``."""
+    import electrum_aionostr as aionostr
+    from electrum_aionostr.key import PrivateKey
+
+    sk = PrivateKey()
+
+    async def _run() -> List[Any]:
+        manager = aionostr.Manager(relays=[relay], private_key=sk.hex())
+        await manager.connect()
+        try:
+            events = []
+            async for ev in manager.get_events(
+                    {"kinds": [9735], "authors": [author], "limit": 100},
+                    only_stored=True):
+                events.append(ev)
+            return events
+        finally:
+            await manager.close()
+
+    return asyncio.run(_run())
+
+
+def test_nip57_zap_publishes_9735_receipt(rig) -> None:
+    """Full NIP-57 zap flow through CLINK: a signed kind-9734 rides on the
+    kind-21001 request, we invoice the zap amount, and once LND pays it the
+    plugin publishes a kind-9735 zap receipt (with bolt11/description/preimage
+    tags) to the relay the payer named."""
+    from electrum_aionostr.event import Event
+    from electrum_aionostr.key import PrivateKey
+
+    from clink import zap as zap_mod
+    from clink.noffer import noffer_decode
+
+    noffer = _fresh_noffer()
+    decoded = noffer_decode(noffer)
+    assert decoded.relay, "e2e noffer must advertise the rig relay"
+    available = _available_sat()
+    assert available > 0, "rig wallet should have inbound liquidity after seeding"
+
+    zap_sats = 25
+    payer_sk = PrivateKey()
+    ev = Event(
+        pubkey=payer_sk.public_key.hex(),
+        kind=zap_mod.ZAP_REQUEST_KIND,
+        tags=[["relays", decoded.relay], ["amount", str(zap_sats * 1000)],
+              ["p", decoded.pubkey]],
+        content="zap!",
+    ).sign(payer_sk.hex())
+    zap_raw = json.dumps({
+        "id": ev.id, "pubkey": ev.pubkey, "created_at": ev.created_at,
+        "kind": ev.kind, "tags": ev.tags, "content": ev.content, "sig": ev.sig})
+
+    resp = asyncio.run(request_invoice(
+        noffer, amount_sats=None, timeout=30,
+        payload_override={"offer": decoded.offer, "zap": zap_raw}))
+    assert "bolt11" in resp, resp
+    assert _invoice_amount_sat(resp["bolt11"]) == zap_sats
+
+    _lnd_pay(resp["bolt11"], rig["lnd_grpc"])
+
+    deadline = time.monotonic() + 60
+    receipts: List[Any] = []
+    while time.monotonic() < deadline:
+        receipts = [
+            r for r in _fetch_zap_receipts(decoded.relay, decoded.pubkey)
+            if any(t[0] == "description" and ev.id in t[1] for t in r.tags)]
+        if receipts:
+            break
+        time.sleep(2)
+    assert receipts, "no kind-9735 zap receipt appeared on the rig relay"
+    receipt = receipts[0]
+    d = {t[0]: t for t in receipt.tags}
+    assert receipt.kind == 9735
+    assert receipt.content == ""
+    assert d["p"][1] == decoded.pubkey        # zap recipient = the service
+    assert d["P"][1] == payer_sk.public_key.hex()  # zap sender
+    assert d["bolt11"][1] == resp["bolt11"]   # the exact invoice we issued
+    assert re.fullmatch(r"[0-9a-f]{64}", d["preimage"][1]), receipt
 
 
 def test_over_capacity_returns_error_5(rig) -> None:

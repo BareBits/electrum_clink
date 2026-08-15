@@ -346,7 +346,7 @@ def _issue_server() -> Tuple[Any, _RecordingWallet, Dict[str, Any]]:
     server.reserver = LiquidityReserver(capacity_fn=lambda: 1000, clock_fn=time.time)
     server.devfee = SimpleNamespace(mark_issued=lambda rhash: calls["devfee"].append(rhash))
     server.receipts = SimpleNamespace(
-        remember=lambda rhash, pub, eid, expires_at: calls["receipts"].append(rhash))
+        remember=lambda rhash, pub, eid, expires_at, **kwargs: calls["receipts"].append(rhash))
 
     async def send_response(event, payload):
         calls["responses"].append(payload)

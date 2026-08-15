@@ -44,6 +44,7 @@ from electrum_aionostr.event import Event as nEvent
 from electrum_aionostr.key import PrivateKey
 
 from . import nip44, protocol
+from . import zap as zap_mod
 from .devfee import MIN_PAYOUT_SAT, DevFeeLedger
 from .liquidity import LiquidityReserver, receivable_capacity_sat
 from .liveness import LivenessResult, RelayLivenessMonitor
@@ -622,6 +623,44 @@ class ClinkServer(Logger, EventListener):
         selftest = self.is_selftest_payer(event.pubkey)
         offer_id = protocol.request_offer_id(req)
         offer = self.offers.get(offer_id) if offer_id is not None else None
+
+        # A NIP-57 zap (``zap`` = stringified kind-9734) rides on a normal CLINK
+        # request: validate the 9734 (structure + signature + recipient + amount)
+        # and let its amount supply the invoice. A malformed/forged zap request
+        # is refused up front — it must never mint an invoice from a bogus number.
+        zap_raw = req.get("zap")
+        zap = None
+        if zap_raw is not None:
+            # The spec fixes ``zap`` as a *stringified* kind-9734 event; any
+            # other shape (a JSON object, a number) is a malformed zap request.
+            if isinstance(zap_raw, str):
+                zap = zap_mod.parse_zap_request(zap_raw)
+            err = None if zap is not None else "zap field is not a zap request"
+            if zap is not None:
+                err = zap_mod.zap_request_error(
+                    zap, expected_recipient=self.pubkey_hex)
+            if err:
+                self._record(offer_id or "", protocol.request_amount_sat(req),
+                             "error 4 (invalid zap)")
+                await self.send_response(event, protocol.error_payload(
+                    protocol.ERR_UNSUPPORTED_FEATURE, "Invalid zap request"))
+                return
+
+        # The zap amount (9734 ``amount`` millisats -> sats) is authoritative
+        # when present; it must agree with the request's amount_sats if both are
+        # given. Conflicting amounts are answered before any offer logic runs.
+        if zap is not None:
+            zap_amount, zap_err = zap_mod.zap_invoice_amount_sat(req, zap)
+            if zap_err is not None:
+                self._record(offer_id or "", protocol.request_amount_sat(req),
+                             f"error {zap_err.get('code')} (zap amount mismatch)")
+                await self.send_response(event, zap_err)
+                return
+            # Fold the zap amount into the request so the resolver treats it as
+            # the payer's named amount (fixed-price offers still gate it).
+            req = dict(req)
+            req["amount_sats"] = zap_amount
+
         resolution = protocol.resolve_request(
             req, offer, self.reserver.available_sat(), noffer_for=self._noffer_for)
         if isinstance(resolution, protocol.SendError):
@@ -650,7 +689,7 @@ class ClinkServer(Logger, EventListener):
         expiry_sec = protocol.effective_expiry_sec(req, self.invoice_expiry_sec)
         await self._issue_invoice(
             event, offer, resolution.amount_sat, description,
-            expiry_sec=expiry_sec, selftest=selftest)
+            expiry_sec=expiry_sec, selftest=selftest, zap_raw=zap_raw)
 
     def _record(self, offer_id: str, amount: Optional[int], result: str) -> None:
         # offer_id can originate from a hostile payer; keep the activity feed
@@ -663,7 +702,8 @@ class ClinkServer(Logger, EventListener):
     async def _issue_invoice(self, event: nEvent, offer, amount_sat: int,
                              description: Optional[str] = None, *,
                              expiry_sec: Optional[int] = None,
-                             selftest: bool = False) -> None:
+                             selftest: bool = False,
+                             zap_raw: Optional[str] = None) -> None:
         # The caller (dispatch) computes the effective expiry once from the
         # request (payer's clamped expires_in_seconds, else our default) so the
         # bolt11, reservation and receipt-registry windows all agree.
@@ -703,8 +743,12 @@ class ClinkServer(Logger, EventListener):
             # Remember this hash so the dev fee accrues if (and only if) it is paid.
             self.devfee.mark_issued(request.rhash)
             # Remember who to send the payment receipt to once this invoice settles.
-            evicted = self.receipts.remember(request.rhash, event.pubkey, event.id,
-                                             expires_at=time.time() + expiry)
+            # A zap request is remembered verbatim (with its invoice) so the
+            # kind-9735 receipt can be built and published after settlement.
+            evicted = self.receipts.remember(
+                request.rhash, event.pubkey, event.id,
+                expires_at=time.time() + expiry,
+                zap=zap_raw, bolt11=bolt11)
             # An entry evicted by the registry cap must not orphan its wallet
             # request — drop it (if still unpaid) along with the entry.
             for stale_rhash in (evicted or []):
@@ -862,10 +906,17 @@ class ClinkServer(Logger, EventListener):
         a full retry interval), awaits the relay publish, and only on success
         removes the owed entry. Never raises — a failure leaves the receipt owed
         for the periodic retry loop.
+
+        Two kinds of receipt exist. For a NIP-57 zap request the owed receipt is
+        a kind-9735 *zap receipt* published to the relays the payer named; for a
+        plain CLINK request it is the follow-up kind-21001 event carrying the
+        settlement preimage.
         """
         self.receipts.record_attempt(target.rhash)
         if self.manager is None:
             return False
+        if target.zap:
+            return await self._publish_zap_receipt(target)
         try:
             await asyncio.wait_for(aionostr._add_event(
                 self.manager,
@@ -883,6 +934,67 @@ class ClinkServer(Logger, EventListener):
                          f"for {target.rhash[:10]}…")
         self._record("receipt", None, "receipt sent ✓")
         return True
+
+    async def _publish_zap_receipt(self, target: ReceiptTarget) -> bool:
+        """Publish the kind-9735 zap receipt for a settled zap request.
+
+        Builds the receipt per NIP-57 (empty content, ``p``/``P``/``e``/``a``/
+        ``k``/``bolt11``/``description``/``preimage`` tags, ``created_at`` = the
+        payment time) and publishes it to every relay the payer named in the
+        9734's ``relays`` tag, counting a relay as delivered only when it
+        accepted the event. Returns True when at least one relay took it.
+        """
+        zap = zap_mod.zap_receipt_from_target(target)
+        relays = zap_mod.zap_relays(zap) if zap is not None else []
+        if zap is None or not relays:
+            # Nothing can be reconstructed (or nowhere to publish): the entry
+            # is owed for nothing — drop it so we never retry a dead receipt.
+            self.receipts.mark_sent(target.rhash)
+            return True
+        try:
+            from electrum_aionostr.event import Event
+        except Exception:
+            self.receipts.mark_sent(target.rhash)
+            return True
+        tags = zap_mod.zap_receipt_tags(
+            zap, target.zap or "", target.bolt11 or "", target.preimage)
+        try:
+            receipt = Event(
+                pubkey=self.pubkey_hex,
+                created_at=max(int(target.due_since), 1),
+                kind=zap_mod.ZAP_RECEIPT_KIND,
+                tags=tags,
+                content="",
+            ).sign(self.private_key.hex())
+        except Exception:
+            self.logger.exception(f"could not build zap receipt for {target.rhash[:10]}…")
+            self.receipts.mark_sent(target.rhash)
+            return True
+        factory = self._proxy_factory()
+        published = 0
+        for relay in relays:
+            try:
+                await asyncio.wait_for(
+                    self._publish_event_to(relay, receipt, factory), timeout=30)
+                published += 1
+            except Exception as e:
+                self.logger.warning(
+                    f"zap receipt to {relay} failed for {target.rhash[:10]}…: {e!r}")
+        if published:
+            self.receipts.mark_sent(target.rhash)
+            self.logger.info(f"zap receipt published to {published} relay(s) "
+                             f"for {target.rhash[:10]}…")
+            self._record("receipt", None, "zap receipt sent ✓")
+            return True
+        return False
+
+    async def _publish_event_to(self, relay: str, event: Any, factory: Any) -> None:
+        """Publish ``event`` to a single relay over a fresh one-shot manager."""
+        async with aionostr.Manager(
+                relays=[relay], private_key=self.private_key.hex(),
+                ssl_context=self.ssl_context,
+                proxy=factory() if factory else None) as man:
+            await man.add_event(event)
 
     async def _redeliver_receipts(self) -> None:
         """Retry any owed receipts now and hourly thereafter.

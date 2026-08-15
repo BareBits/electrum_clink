@@ -71,8 +71,9 @@ def _dispatch_server() -> Tuple[Any, Dict[str, List[Any]]]:
     async def issue_invoice(event: Any, offer: Any, amount_sat: int,
                             description: Optional[str] = None, *,
                             expiry_sec: Optional[int] = None,
-                            selftest: bool = False) -> None:
-        calls["issued"].append((amount_sat, description, expiry_sec, selftest))
+                            selftest: bool = False,
+                            zap_raw: Optional[str] = None) -> None:
+        calls["issued"].append((amount_sat, description, expiry_sec, selftest, zap_raw))
 
     server.send_response = send_response  # type: ignore[method-assign]
     server._issue_invoice = issue_invoice  # type: ignore[method-assign]
@@ -105,7 +106,7 @@ VALID_REQ = {"offer": "o1", "amount_sats": 500}
 def test_valid_request_issues_invoice() -> None:
     server, calls = _dispatch_server()
     _dispatch(server, _request_event(server, PrivateKey(), VALID_REQ))
-    assert calls["issued"] == [(500, None, 120, False)]
+    assert calls["issued"] == [(500, None, 120, False, None)]
     assert calls["responses"] == []
 
 
@@ -115,7 +116,7 @@ def test_payer_requested_expiry_is_honored() -> None:
     server, calls = _dispatch_server()
     req = dict(VALID_REQ, expires_in_seconds=300)
     _dispatch(server, _request_event(server, PrivateKey(), req))
-    assert calls["issued"] == [(500, None, 300, False)]
+    assert calls["issued"] == [(500, None, 300, False, None)]
 
 
 def test_payer_requested_expiry_is_clamped_to_cap() -> None:
@@ -124,14 +125,14 @@ def test_payer_requested_expiry_is_clamped_to_cap() -> None:
     server, calls = _dispatch_server()
     req = dict(VALID_REQ, expires_in_seconds=protocol.MAX_INVOICE_EXPIRY_SEC + 7 * 24 * 3600)
     _dispatch(server, _request_event(server, PrivateKey(), req))
-    assert calls["issued"] == [(500, None, protocol.MAX_INVOICE_EXPIRY_SEC, False)]
+    assert calls["issued"] == [(500, None, protocol.MAX_INVOICE_EXPIRY_SEC, False, None)]
 
 
 def test_payer_requested_expiry_is_clamped_to_floor() -> None:
     server, calls = _dispatch_server()
     req = dict(VALID_REQ, expires_in_seconds=1)  # unpayably short
     _dispatch(server, _request_event(server, PrivateKey(), req))
-    assert calls["issued"] == [(500, None, protocol.MIN_INVOICE_EXPIRY_SEC, False)]
+    assert calls["issued"] == [(500, None, protocol.MIN_INVOICE_EXPIRY_SEC, False, None)]
 
 
 def test_absent_or_mistyped_expiry_falls_back_to_default() -> None:
@@ -141,7 +142,7 @@ def test_absent_or_mistyped_expiry_falls_back_to_default() -> None:
         if bad is not None:
             req["expires_in_seconds"] = bad
         _dispatch(server, _request_event(server, PrivateKey(), req))
-    assert calls["issued"] == [(500, None, 120, False)] * 4
+    assert calls["issued"] == [(500, None, 120, False, None)] * 4
 
 
 # --- fixed-price offers --------------------------------------------------------
@@ -175,8 +176,9 @@ def _fixed_dispatch_server() -> Tuple[Any, Dict[str, List[Any]]]:
     async def issue_invoice(event: Any, offer: Any, amount_sat: int,
                             description: Optional[str] = None, *,
                             expiry_sec: Optional[int] = None,
-                            selftest: bool = False) -> None:
-        calls["issued"].append((amount_sat, description, expiry_sec, selftest))
+                            selftest: bool = False,
+                            zap_raw: Optional[str] = None) -> None:
+        calls["issued"].append((amount_sat, description, expiry_sec, selftest, zap_raw))
 
     server.send_response = send_response  # type: ignore[method-assign]
     server._issue_invoice = issue_invoice  # type: ignore[method-assign]
@@ -187,14 +189,14 @@ def test_fixed_offer_issues_invoice_at_price_without_amount() -> None:
     server, calls = _fixed_dispatch_server()
     # The spec makes amount_sats optional for a fixed offer.
     _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1"}))
-    assert calls["issued"] == [(25000, None, 120, False)]
+    assert calls["issued"] == [(25000, None, 120, False, None)]
     assert calls["responses"] == []
 
 
 def test_fixed_offer_issues_invoice_at_matching_amount() -> None:
     server, calls = _fixed_dispatch_server()
     _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1", "amount_sats": 25000}))
-    assert calls["issued"] == [(25000, None, 120, False)]
+    assert calls["issued"] == [(25000, None, 120, False, None)]
 
 
 def test_fixed_offer_rejects_differing_amount_at_dispatch() -> None:
@@ -242,8 +244,9 @@ def _replacement_dispatch_server() -> Tuple[Any, Dict[str, List[Any]]]:
     async def issue_invoice(event: Any, offer: Any, amount_sat: int,
                             description: Optional[str] = None, *,
                             expiry_sec: Optional[int] = None,
-                            selftest: bool = False) -> None:
-        calls["issued"].append((amount_sat, description, expiry_sec, selftest))
+                            selftest: bool = False,
+                            zap_raw: Optional[str] = None) -> None:
+        calls["issued"].append((amount_sat, description, expiry_sec, selftest, zap_raw))
 
     server.send_response = send_response  # type: ignore[method-assign]
     server._issue_invoice = issue_invoice  # type: ignore[method-assign]
@@ -289,8 +292,9 @@ def test_expired_offer_answers_code_3_without_latest() -> None:
     async def issue_invoice(event: Any, offer: Any, amount_sat: int,
                             description: Optional[str] = None, *,
                             expiry_sec: Optional[int] = None,
-                            selftest: bool = False) -> None:
-        calls["issued"].append((amount_sat, description, expiry_sec, selftest))
+                            selftest: bool = False,
+                            zap_raw: Optional[str] = None) -> None:
+        calls["issued"].append((amount_sat, description, expiry_sec, selftest, zap_raw))
 
     server.send_response = send_response  # type: ignore[method-assign]
     server._issue_invoice = issue_invoice  # type: ignore[method-assign]
@@ -372,7 +376,7 @@ def test_duplicate_event_processed_once() -> None:
     event = _request_event(server, PrivateKey(), VALID_REQ)
     _dispatch(server, event)
     _dispatch(server, event)  # e.g. redelivered by a second relay
-    assert calls["issued"] == [(500, None, 120, False)]
+    assert calls["issued"] == [(500, None, 120, False, None)]
     assert calls["responses"] == []  # the replay is dropped silently
 
 
@@ -390,7 +394,7 @@ def test_junk_events_do_not_pollute_seen_cache() -> None:
         _dispatch(server, junk)
     assert len(server._seen_events) == 1  # only the decryptable request was recorded
     _dispatch(server, valid)              # ...and its replay is still blocked
-    assert calls["issued"] == [(500, None, 120, False)]
+    assert calls["issued"] == [(500, None, 120, False, None)]
 
 
 # --- request schema validation ------------------------------------------------
@@ -436,7 +440,7 @@ def test_payer_below_cap_is_served() -> None:
     server.receipts = SimpleNamespace(
         pending_count_for=lambda pub: MAX_PENDING_PER_PAYER - 1)
     _dispatch(server, _request_event(server, PrivateKey(), VALID_REQ))
-    assert calls["issued"] == [(500, None, 120, False)]
+    assert calls["issued"] == [(500, None, 120, False, None)]
 
 
 def test_selftest_payer_bypasses_cap() -> None:
@@ -448,7 +452,7 @@ def test_selftest_payer_bypasses_cap() -> None:
     payer_sk = PrivateKey()
     server._selftest_payers[payer_sk.public_key.hex()] = time.time() + 60
     _dispatch(server, _request_event(server, payer_sk, VALID_REQ))
-    assert calls["issued"] == [(500, None, 120, True)]
+    assert calls["issued"] == [(500, None, 120, True, None)]
 
 
 # --- error hygiene ------------------------------------------------------------
@@ -533,3 +537,117 @@ def test_gc_tolerates_missing_request() -> None:
     server, wallet = _gc_server(None)
     server._delete_stale_request("aa" * 32)  # must not raise
     assert wallet.deleted == []
+
+
+# --- NIP-57 zaps (kind 9734 riding on the kind-21001 request) -----------------
+
+def _signed_zap9734(recipient: str, *, amount_msat: int = 5000,
+                    relays: Tuple[str, ...] = ("wss://relay.example",),
+                    sender_sk: Optional[PrivateKey] = None,
+                    tags_extra: Optional[List[List[str]]] = None,
+                    content: str = "zap!") -> Tuple[PrivateKey, str]:
+    """A genuinely signed kind-9734 zap request (and the signing key)."""
+    from electrum_aionostr.event import Event
+
+    from clink import zap as zap_mod
+
+    sender_sk = sender_sk or PrivateKey()
+    tags = [["relays", *relays], ["p", recipient], *(tags_extra or [])]
+    if amount_msat is not None:
+        tags.append(["amount", str(amount_msat)])
+    ev = Event(
+        pubkey=sender_sk.public_key.hex(), kind=zap_mod.ZAP_REQUEST_KIND,
+        tags=tags, content=content,
+    ).sign(sender_sk.hex())
+    return sender_sk, json.dumps({
+        "id": ev.id, "pubkey": ev.pubkey, "created_at": ev.created_at,
+        "kind": ev.kind, "tags": ev.tags, "content": ev.content, "sig": ev.sig})
+
+
+def _zap_request_event(server: Any, payer_sk: PrivateKey, zap_raw: str, *,
+                       amount_sats: Optional[int] = None,
+                       offer: str = "o1") -> Event:
+    req: Dict[str, Any] = {"offer": offer, "zap": zap_raw}
+    if amount_sats is not None:
+        req["amount_sats"] = amount_sats
+    return _request_event(server, payer_sk, req)
+
+
+def test_zap_request_issues_invoice_at_zap_amount() -> None:
+    server, calls = _dispatch_server()
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=21000)  # 21 sat
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw))
+    assert calls["issued"] == [(21, None, 120, False, zap_raw)]
+    assert calls["responses"] == []
+
+
+def test_zap_amount_and_request_amount_must_agree() -> None:
+    server, calls = _dispatch_server()
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=21000)
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw, amount_sats=99))
+    assert calls["issued"] == []
+    assert calls["responses"] == [{
+        "code": protocol.ERR_INVALID_AMOUNT, "error": "Invalid Amount",
+        "range": {"min": 21, "max": 99}}]
+
+
+def test_zap_without_amount_uses_request_amount() -> None:
+    server, calls = _dispatch_server()
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=None)
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw, amount_sats=7))
+    assert calls["issued"] == [(7, None, 120, False, zap_raw)]
+
+
+def test_zap_without_any_amount_is_invalid_amount() -> None:
+    server, calls = _dispatch_server()
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=None)
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw))
+    assert calls["issued"] == []
+    assert calls["responses"] and calls["responses"][0]["code"] == protocol.ERR_INVALID_AMOUNT
+
+
+def test_forged_zap_request_is_refused() -> None:
+    server, calls = _dispatch_server()
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=21000)
+    forged = json.loads(zap_raw)
+    forged["content"] = "tampered"
+    _dispatch(server, _zap_request_event(
+        server, PrivateKey(), json.dumps(forged)))
+    assert calls["issued"] == []
+    assert calls["responses"] == [{
+        "code": protocol.ERR_UNSUPPORTED_FEATURE, "error": "Invalid zap request"}]
+
+
+def test_zap_for_another_service_is_refused() -> None:
+    server, calls = _dispatch_server()
+    # The 9734 zaps someone else; the CLINK request still addressed us.
+    _, zap_raw = _signed_zap9734("bb" * 32, amount_msat=21000)
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw))
+    assert calls["issued"] == []
+    assert calls["responses"] and calls["responses"][0]["code"] == protocol.ERR_UNSUPPORTED_FEATURE
+
+
+def test_non_string_zap_field_is_refused() -> None:
+    server, calls = _dispatch_server()
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=21000)
+    req = {"offer": "o1", "zap": json.loads(zap_raw)}  # object, not stringified
+    _dispatch(server, _request_event(server, PrivateKey(), req))
+    assert calls["issued"] == []
+    assert calls["responses"] and calls["responses"][0]["code"] == protocol.ERR_UNSUPPORTED_FEATURE
+
+
+def test_fixed_offer_zap_must_match_price() -> None:
+    server, calls = _fixed_dispatch_server()  # price 25000
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=25000000)  # 25000 sat
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw))
+    assert calls["issued"] == [(25000, None, 120, False, zap_raw)]
+
+
+def test_fixed_offer_zap_rejects_wrong_amount() -> None:
+    server, calls = _fixed_dispatch_server()  # price 25000
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=1000)  # 1 sat
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw))
+    assert calls["issued"] == []
+    assert calls["responses"] == [{
+        "code": protocol.ERR_INVALID_AMOUNT, "error": "Invalid Amount",
+        "range": {"min": 25000, "max": 25000}}]
