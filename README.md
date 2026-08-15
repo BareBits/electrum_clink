@@ -22,7 +22,7 @@ This software is developed by BareBits. Need simple Bitcoin payments for your po
 
 An *optional* .1% dev fee is included by default, which can be disabled in the settings. This dev fee helps fund development and is counted against any funds you receive via CLINK noffers.
 
-## What it does (v1)
+## What it does
 
 * **Generate noffers.** Each offer is a *spontaneous* offer (the payer names the
   amount). The plugin derives a stable Nostr identity from the wallet's
@@ -46,10 +46,22 @@ An *optional* .1% dev fee is included by default, which can be disabled in the s
   per-offer toggle (`allow_payer_memo`, on by default); disable it and invoices
   always carry just the label. Both are editable in the CLINK tab and via CLI.
 * **Payment receipts.** When an issued invoice is actually paid, the plugin sends
-  the payer a follow-up kind-`21001` event whose decrypted body is `{"res":"ok"}`
-  — the receipt the reference `@shocknet/clink-sdk` surfaces via its `onReceipt`
-  callback. Owed receipts are persisted, so they survive a relay drop or restart:
-  delivery is retried hourly for up to 10 days until the relay accepts it.
+  the payer a follow-up kind-`21001` event whose decrypted body is
+  `{"res":"ok","preimage":"<settlement preimage>"}` — the receipt the reference
+  `@shocknet/clink-sdk` surfaces via its `onReceipt` callback (and the exact
+  `res`/`preimage` shape the `NofferReceipt` type expects). Owed receipts are
+  persisted, so they survive a relay drop or restart: delivery is retried hourly
+  for up to 10 days until the relay accepts it.
+* **Payer-requested invoice expiry.** A request may name how long its invoice
+  should stay valid via `expires_in_seconds`; the value is honored but clamped
+  to a 60 s–24 h sanity window, so a hostile payer can never pin inbound
+  liquidity for longer than a day nor mint an unpayably short invoice. The same
+  value drives the bolt11 `exp_delay`, the liquidity reservation, and the
+  receipt registry's expiry.
+* **Fixed-price offers.** An offer can pin a fixed price (`clink_add_offer
+  --price`); requests that don't match it are refused with error code 5 naming
+  the exact price, instead of a range. Spontaneous offers (no price) keep the
+  range semantics.
 * **Inbound-liquidity locking.** An issued invoice *reserves* the inbound
   liquidity it needs until it is paid or expires (default 120 s, configurable),
   so two concurrent requests can't both be promised the same capacity. A request
@@ -87,6 +99,28 @@ An *optional* .1% dev fee is included by default, which can be disabled in the s
 * **Debits / management** (`ndebit` / `nmanage`) are **not** implemented yet;
   they are stubbed via the protocol's "unsupported feature" path so they can be
   added without restructuring.
+* **Offer expiry & moves.** An offer can be given an absolute lifetime
+  (`clink_add_offer --expires-in`); once past it, the offer stops answering and
+  requests reply with error code 3 ("expired"). `clink_replace_offer` moves
+  payers from one offer onto another: the outgoing offer replies with error
+  code 3 ("moved") carrying the replacement's noffer in the `latest` field, so a
+  payer holding a stale noffer updates and retries automatically. Both code-3
+  payloads carry the `latest` noffer that should be used going forward.
+* **Kind-0 metadata advertisement.** The default offer's noffer is advertised in
+  the identity's Nostr kind-0 profile metadata (`clink_offer` field), so a
+  `kind0 -> clink_offer`-style lookup resolves straight to a payable noffer. The
+  plugin fetches the identity's current metadata, merges the noffer in
+  (preserving every other profile field), and republishes only when something
+  changed. Opt out via `plugins.clink.advertise_metadata`; reconcile on demand
+  with `clink_advertise_offer` and preview with `clink_metadata_status`.
+* **NIP-57 zaps.** A request may carry a signed kind-`9734` zap request in its
+  `zap` field. It is validated per NIP-57 (exactly one `p` tag naming us, at
+  most one each of `e`/`a`, well-formed `k`/`P`, ≥1 `relays` tag, fresh
+  `created_at`, and a real BIP-340 signature — forged events are refused), and
+  the zap amount (msat, rounded up) is authoritative for the invoice. When the
+  zap is settled, the plugin publishes a kind-`9735` zap receipt (with
+  `p`/`P`/`e`/`a`/`k`/`bolt11`/`description`/`preimage` tags) to the relay the
+  payer named. See `zap.py`.
 
 ## Layout
 
@@ -104,6 +138,8 @@ clink/                 # the importable plugin package (this is what ships)
   receipts.py          # persisted payment-receipt registry (retry across restarts)
   offers.py            # offer model + persistence
   protocol.py          # request/response payloads + resolution policy
+  metadata.py          # kind-0 metadata advertisement (merge/select helpers)
+  zap.py               # NIP-57 zap requests + kind-9735 receipts (pure logic)
   cmdline.py, qt.py    # per-GUI bindings (the 'CLINK' tab lives in qt.py)
 tests/                 # pytest: unit (offline) + e2e (drives the rig)
 scripts/build_zip.py   # package as an Electrum external-plugin zip
@@ -122,6 +158,7 @@ dependencies**.
 | `plugins.clink.devfee_enabled` | `true` | collect the optional dev fee (opt-out) |
 | `plugins.clink.devfee_rate_percent` | `0.1` | dev-fee rate, % of each inbound payment (0.001–5) |
 | `plugins.clink.devfee_dest` | `clink_fees@getbarebits.com` | Lightning address / LNURL / URL the fee is forwarded to |
+| `plugins.clink.advertise_metadata` | `true` | publish the default offer's noffer in the identity's kind-0 profile metadata (`clink_offer` field) |
 
 # Terms of Use
 
@@ -140,9 +177,12 @@ When enabled, the plugin registers `clink_`-prefixed commands:
 ```bash
 electrum clink_add_offer --label "coffee"   # -> {offer_id, label, allow_payer_memo, noffer}
 electrum clink_add_offer --label "coffee" --allow_payer_memo false  # never fold in payer memos
+electrum clink_add_offer --price 5000                  # fixed-price offer (5000 sats)
+electrum clink_add_offer --expires-in 3600             # offer expires in 1h (code-3 "expired" after)
 electrum clink_list_offers
 electrum clink_set_offer_label <offer_id> --label "tea"   # rename an offer
 electrum clink_set_offer_payer_memo <offer_id> false      # allow/disallow payer memos
+electrum clink_replace_offer <offer_id> <replacement_id>  # move payers, code-3 "moved" with the new noffer
 electrum clink_remove_offer <offer_id>
 electrum clink_check_noffers                # self-test every noffer end to end
 electrum clink_check_noffers --offer_id <offer_id>  # ...or just one
@@ -150,6 +190,8 @@ electrum clink_check_relays                 # probe every relay your noffers adv
 electrum clink_clink_status                 # available / reserved liquidity
 electrum clink_devfee_status                # dev-fee settings + owed balance
 electrum clink_devfee_pay                   # force a payout now (testing)
+electrum clink_advertise_offer              # reconcile the kind-0 metadata advertisement now
+electrum clink_metadata_status              # preview what the kind-0 advertisement would publish
 ```
 
 ## Tests
