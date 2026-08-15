@@ -9,26 +9,47 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QPixmap, QImage
-from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
-    QScrollArea, QSlider, QSpinBox, QTextEdit, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+from electrum.gui.common_qt.util import paintQR
+from electrum.gui.qt.util import (
+    Buttons,
+    CancelButton,
+    CloseButton,
+    ColorScheme,
+    OkButton,
+    WindowModalDialog,
+    read_QIcon,
 )
-
 from electrum.i18n import _
 from electrum.plugin import hook
 from electrum.util import UserCancelled, get_asyncio_loop
-from electrum.gui.qt.util import (
-    Buttons, CancelButton, CloseButton, ColorScheme, OkButton, WindowModalDialog,
-    read_QIcon,
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QSpinBox,
+    QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
-from electrum.gui.common_qt.util import paintQR
 
 from . import protocol
 from .clink_plugin import ClinkPlugin
@@ -74,9 +95,10 @@ def _fmt_pct(pct: float) -> str:
 COL_LABEL = 0
 COL_MEMO = 1
 COL_OFFER = 2
-COL_NOFFER = 3
-COL_RELAY = 4
-COL_STATUS = 5
+COL_PRICE = 3
+COL_NOFFER = 4
+COL_RELAY = 5
+COL_STATUS = 6
 
 # First entry of the relay dropdown in the "New offer" dialog: use the
 # automatically probed relay rather than a fixed one.
@@ -96,8 +118,8 @@ GROW_TARGET_W = 1000
 GROW_TARGET_H = 760
 
 if TYPE_CHECKING:
-    from electrum.wallet import Abstract_Wallet
     from electrum.gui.qt.main_window import ElectrumWindow
+    from electrum.wallet import Abstract_Wallet
 
 
 class Plugin(ClinkPlugin):
@@ -183,7 +205,8 @@ class ClinkTab(QWidget):
         root.addWidget(QLabel(_("Offers (double-click a label to rename):")))
         self.offers_list = QTreeWidget()
         self.offers_list.setHeaderLabels(
-            [_("Label"), _("Payer memo"), _("Offer id"), _("noffer"), _("Relay"), _("Status")])
+            [_("Label"), _("Payer memo"), _("Offer id"), _("Price"),
+             _("noffer"), _("Relay"), _("Status")])
         self.offers_list.setRootIsDecorated(False)
         self.offers_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         # We drive editing ourselves (only the label column, on double-click), so
@@ -191,6 +214,7 @@ class ClinkTab(QWidget):
         self.offers_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.offers_list.header().setSectionResizeMode(COL_NOFFER, QHeaderView.ResizeMode.Stretch)
         self.offers_list.header().setSectionResizeMode(COL_MEMO, QHeaderView.ResizeMode.ResizeToContents)
+        self.offers_list.header().setSectionResizeMode(COL_PRICE, QHeaderView.ResizeMode.ResizeToContents)
         self.offers_list.header().setSectionResizeMode(COL_RELAY, QHeaderView.ResizeMode.ResizeToContents)
         self.offers_list.header().setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
         self.offers_list.itemSelectionChanged.connect(self._update_buttons)
@@ -342,7 +366,7 @@ class ClinkTab(QWidget):
         result = self._prompt_offer_details()
         if result is None:
             return
-        label, allow_memo, relay = result
+        label, allow_memo, price, relay = result
         # create_offer probes the relay (the auto pick is cached 24h; a failing
         # probe blocks creation for custom and automatic relays alike), so run
         # it in a waiting dialog rather than freezing the tab.
@@ -352,7 +376,8 @@ class ClinkTab(QWidget):
         try:
             self.window.run_coroutine_dialog(
                 self.plugin.create_offer(
-                    label=label, allow_payer_memo=allow_memo, relay=relay),
+                    label=label, allow_payer_memo=allow_memo, relay=relay,
+                    price=price),
                 message,
             )
         except UserCancelled:
@@ -362,12 +387,14 @@ class ClinkTab(QWidget):
             return
         self._refresh()
 
-    def _prompt_offer_details(self) -> Optional[Tuple[str, bool, str]]:
-        """Ask for a new offer's label, memo policy and relay.
+    def _prompt_offer_details(self) -> Optional[Tuple[str, bool, Optional[int], str]]:
+        """Ask for a new offer's label, memo policy, optional fixed price and relay.
 
-        Returns ``(label, allow_payer_memo, relay)`` — ``relay`` is ``""`` for
-        automatic selection — or ``None`` if cancelled. A malformed typed relay
-        re-opens the dialog (with the input preserved) instead of accepting.
+        Returns ``(label, allow_payer_memo, price, relay)`` — ``price`` is
+        ``None`` for a spontaneous offer, ``relay`` is ``""`` for automatic
+        selection — or ``None`` if cancelled. A malformed typed relay or a
+        non-integer price re-opens the dialog (with the inputs preserved)
+        instead of accepting.
         """
         d = WindowModalDialog(self.window, _("New CLINK offer"))
         vbox = QVBoxLayout(d)
@@ -381,6 +408,16 @@ class ClinkTab(QWidget):
             "When enabled, a note sent by the payer is folded into the invoice "
             "memo. When disabled, the invoice always uses this offer's label."))
         vbox.addWidget(memo_cb)
+        vbox.addWidget(QLabel(_("Fixed price in sats (optional):")))
+        price_edit = QLineEdit()
+        price_edit.setPlaceholderText(_("e.g. 25000 — leave empty for a "
+                                        "spontaneous offer"))
+        price_edit.setToolTip(_(
+            "A positive amount in sats. When set, this becomes a fixed-price "
+            "offer: its noffer advertises the price and every invoice is minted "
+            "for exactly this amount. Leave empty for a spontaneous offer whose "
+            "amount the payer chooses."))
+        vbox.addWidget(price_edit)
         vbox.addWidget(QLabel(_("Relay:")))
         relay_combo = QComboBox()
         relay_combo.setEditable(True)
@@ -401,6 +438,17 @@ class ClinkTab(QWidget):
         while True:
             if not d.exec():
                 return None
+            price_text = price_edit.text().strip()
+            if price_text:
+                if not (price_text.isascii() and price_text.isdigit()):
+                    self.window.show_error(_("Invalid price: must be a positive "
+                                             "integer amount in sats."))
+                    continue
+                # "0" is treated as "no fixed price" (spontaneous), matching the
+                # create_offer API.
+                price = int(price_text) or None
+            else:
+                price = None
             relay_text = relay_combo.currentText().strip()
             if not relay_text or relay_text == RELAY_AUTO_LABEL:
                 relay = ""
@@ -410,7 +458,7 @@ class ClinkTab(QWidget):
                 except ValueError as e:
                     self.window.show_error(_("Invalid relay URL: {}").format(e))
                     continue
-            return label_edit.text().strip(), memo_cb.isChecked(), relay
+            return label_edit.text().strip(), memo_cb.isChecked(), price, relay
 
     def _on_remove(self) -> None:
         offer_id = self._selected_offer_id()
@@ -515,6 +563,28 @@ class ClinkTab(QWidget):
             tooltip += f"\n{result.detail}"
         return text, tooltip
 
+    def _retired_state(self, item: Any) -> Optional[Tuple[str, str]]:
+        """(text, tooltip) when this offer is moved or expired, else ``None``.
+
+        A replaced offer stopped answering and points its payers at a new
+        noffer; a time-expired offer answers code 3 with no pointer. Either
+        state is surfaced in the status column ahead of any self-test result,
+        since the check would only confirm the expiry.
+        """
+        info = self.plugin.list_offers().get(item.data(COL_LABEL, OFFER_ID_ROLE))
+        if not info:
+            return None
+        if info.get("replaced_by"):
+            return (_("→ moved"), _(
+                "This offer is retired and redirects payers to its replacement "
+                "noffer automatically (code 3, 'latest')."))
+        expires_at = info.get("expires_at") or 0
+        if expires_at and expires_at <= int(time.time()):
+            return (_("✗ expired"), _(
+                "This offer passed its expiry time; payers get a code-3 "
+                "'expired' response and no invoice."))
+        return None
+
     def _refresh_check_column(self) -> None:
         results = self.plugin.noffer_check_results()
         self.check_btn.setText(
@@ -523,7 +593,11 @@ class ClinkTab(QWidget):
         for i in range(self.offers_list.topLevelItemCount()):
             item = self.offers_list.topLevelItem(i)
             offer_id = item.data(COL_LABEL, OFFER_ID_ROLE)
-            text, tooltip = self._status_cell(results.get(offer_id))
+            retired = self._retired_state(item)
+            if retired is not None:
+                text, tooltip = retired
+            else:
+                text, tooltip = self._status_cell(results.get(offer_id))
             if item.text(COL_STATUS) != text:
                 item.setText(COL_STATUS, text)
             item.setToolTip(COL_STATUS, tooltip)
@@ -594,9 +668,35 @@ class ClinkTab(QWidget):
         try:
             self.offers_list.clear()
             for offer_id, info in self.plugin.list_offers().items():
+                price_type = info.get("price_type")
+                price = info.get("price")
+                if price_type == 0 and isinstance(price, int) and price > 0:
+                    price_text = _("fixed {} sat").format(price)
+                    price_tooltip = _(
+                        "Fixed-price offer: every invoice is minted for exactly "
+                        "{} sats. The payer cannot name a different amount.")
+                    price_tooltip = price_tooltip.format(price)
+                elif price_type == 1:
+                    price_text = _("variable")
+                    price_tooltip = _("Variable-price offer.")
+                else:
+                    price_text = _("spontaneous")
+                    price_tooltip = _(
+                        "Spontaneous offer: the payer chooses the amount.")
                 item = QTreeWidgetItem(
-                    [info["label"], "", offer_id, info["noffer"],
+                    [info["label"], "", offer_id, price_text, info["noffer"],
                      info.get("relay", ""), ""])
+                expires_at = info.get("expires_at") or 0
+                if expires_at:
+                    when = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M")
+                    price_tooltip += "\n" + _(
+                        "This offer expires at {}; payers get a code-3 'expired' "
+                        "response afterwards.").format(when)
+                if info.get("replaced_by"):
+                    price_tooltip += "\n" + _(
+                        "This offer is retired and redirects payers to its "
+                        "replacement noffer (code 3, 'latest').")
+                item.setToolTip(COL_PRICE, price_tooltip)
                 item.setData(COL_LABEL, OFFER_ID_ROLE, offer_id)
                 if info.get("relay_custom"):
                     relay_tooltip = _(
