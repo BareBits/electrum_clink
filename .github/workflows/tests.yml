@@ -1,0 +1,58 @@
+name: Tests
+
+# CI for the plugin: ruff on every push/PR, plus the offline unit suite across
+# supported Pythons. The e2e (regtest-rig) and live_relay suites are opt-in and
+# run locally, not here.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff==0.16.3
+
+      - name: Run ruff
+        run: ruff check clink tests scripts
+
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Checkout Electrum source
+        # The unit tests `import electrum`, which is not published on PyPI, so we
+        # clone the pinned release we develop against. Bump when the plugin's
+        # minimum supported Electrum moves on.
+        run: git clone --depth 1 --branch 4.8.1 https://github.com/spesmilo/electrum.git electrum-src
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r electrum-src/contrib/requirements/requirements.txt
+          pip install pycryptodomex pytest
+
+      - name: Run unit tests
+        env:
+          PYTHONPATH: electrum-src
+        run: python -m pytest -q

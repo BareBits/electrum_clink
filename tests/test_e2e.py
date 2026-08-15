@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -99,8 +100,20 @@ def _invoice_memo(bolt11: str) -> str:
     return decode_bolt11_invoice(bolt11, net=constants.BitcoinRegtest).get_description()
 
 
+def _invoice_amount_sat(bolt11: str) -> int:
+    from electrum import constants
+    from electrum.bolt11 import decode_bolt11_invoice
+    return decode_bolt11_invoice(bolt11, net=constants.BitcoinRegtest).get_amount_sat()
+
+
 def _fresh_noffer() -> str:
     created = json.loads(_electrum_cli("clink_add_offer", "--label", "e2e"))
+    return created["noffer"]
+
+
+def _fresh_fixed_noffer(price: int) -> str:
+    created = json.loads(_electrum_cli(
+        "clink_add_offer", "--label", "e2e", "--price", str(price)))
     return created["noffer"]
 
 
@@ -207,9 +220,66 @@ def test_disallowed_payer_memo_is_ignored(rig) -> None:
     assert _invoice_memo(resp["bolt11"]) == "e2e"
 
 
+def test_fixed_offer_invoice_and_amount_validation(rig) -> None:
+    """A fixed-price offer mints invoices at exactly its price: a request with
+    no amount gets the price, and a mismatched amount gets error code 5 whose
+    range collapses to the exact price (not an over-promising capacity hint)."""
+    noffer = _fresh_fixed_noffer(420)
+    assert _available_sat() >= 420, "rig wallet should have inbound liquidity after seeding"
+
+    # No amount -> the fixed price is the invoice amount.
+    resp = asyncio.run(request_invoice(noffer, amount_sats=None, timeout=30))
+    assert "bolt11" in resp, resp
+    assert _invoice_amount_sat(resp["bolt11"]) == 420
+
+    # Matching amount -> accepted too (the reference SDK always sends one).
+    resp = asyncio.run(request_invoice(noffer, amount_sats=420, timeout=30))
+    assert "bolt11" in resp, resp
+    assert _invoice_amount_sat(resp["bolt11"]) == 420
+
+    # Differing amount -> invalid amount, range is exactly the fixed price.
+    resp = asyncio.run(request_invoice(noffer, amount_sats=1, timeout=30))
+    assert resp.get("code") == 5, resp
+    assert resp["range"] == {"min": 420, "max": 420}
+
+
+def test_moved_offer_answers_code_3_with_latest(rig) -> None:
+    """After ``clink_replace_offer old new``, a request for the retired offer
+    answers code 3 (Expired or Moved) carrying ``latest`` = the replacement's
+    noffer, so a payer holding the stale noffer updates and retries."""
+    from clink.noffer import noffer_decode
+
+    old = json.loads(_electrum_cli("clink_add_offer", "--label", "e2e-old"))
+    new = json.loads(_electrum_cli("clink_add_offer", "--label", "e2e-new"))
+    out = _electrum_cli("clink_replace_offer", old["offer_id"], new["offer_id"])
+    assert "moved" in out, out
+
+    resp = asyncio.run(request_invoice(old["noffer"], amount_sats=1000, timeout=30))
+    assert resp.get("code") == 3, resp
+    latest = resp.get("latest")
+    assert latest, resp
+    assert noffer_decode(latest).offer == new["offer_id"]
+    # the replacement offer itself still works
+    assert noffer_decode(new["noffer"]).offer == new["offer_id"]
+
+
+def test_expired_offer_answers_code_3(rig) -> None:
+    """An offer created with an expiry answers code 3 (Expired) once past it,
+    with no ``latest`` pointer."""
+    created = json.loads(_electrum_cli(
+        "clink_add_offer", "--label", "e2e-expiring", "--expires-in", "1"))
+    assert created["expires_at"] > 0, created
+    time.sleep(2)  # wait out the 1-second lifetime
+    resp = asyncio.run(request_invoice(created["noffer"], amount_sats=1000, timeout=30))
+    assert resp.get("code") == 3, resp
+    assert "latest" not in resp, resp
+
+
 def test_payment_receipt_delivered_after_payment(rig) -> None:
     # Full round trip: request -> invoice -> pay it from LND -> the plugin should
-    # send the payer a kind-21001 {"res":"ok"} receipt on the same subscription.
+    # send the payer a kind-21001 {"res":"ok","preimage":...} receipt (CLINK
+    # spec: standard payments MUST carry the settlement preimage) on the same
+    # subscription.
     noffer = _fresh_noffer()
     available = _available_sat()
     assert available > 0, "rig wallet should have inbound liquidity after seeding"
@@ -221,7 +291,8 @@ def test_payment_receipt_delivered_after_payment(rig) -> None:
     ))
     assert "bolt11" in result["invoice"], result
     assert result["invoice"]["bolt11"].lower().startswith("lnbcrt")
-    assert result["receipt"] == {"res": "ok"}, result
+    assert result["receipt"]["res"] == "ok", result
+    assert re.fullmatch(r"[0-9a-f]{64}", result["receipt"]["preimage"]), result
 
 
 def test_over_capacity_returns_error_5(rig) -> None:

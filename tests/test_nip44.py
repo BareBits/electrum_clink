@@ -64,5 +64,6 @@ def test_decrypt_rejects_tampered_mac(nip44_vectors) -> None:
 def test_decrypt_invalid_vectors(nip44_vectors) -> None:
     for vec in nip44_vectors["invalid"]["decrypt"]:
         conv_key = bytes.fromhex(vec["conversation_key"])
-        with pytest.raises(Exception):
+        # vectors are expected to fail in any way (wrong length, bad MAC, ...)
+        with pytest.raises(Exception):  # noqa: B017
             nip44.decrypt(vec["payload"], conv_key)
