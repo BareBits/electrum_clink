@@ -574,8 +574,13 @@ class ClinkServer(Logger, EventListener):
         # Fold in the payer's requested memo only when this offer permits it;
         # otherwise the invoice carries just the merchant's label.
         description = protocol.effective_description(offer, req)
+        # Honor the payer's requested invoice expiry (clamped by protocol) — the
+        # same value gates the bolt11, the liquidity reservation and the
+        # receipt registry, so a request can't widen one window behind another's.
+        expiry_sec = protocol.effective_expiry_sec(req, self.invoice_expiry_sec)
         await self._issue_invoice(
-            event, offer, resolution.amount_sat, description, selftest=selftest)
+            event, offer, resolution.amount_sat, description,
+            expiry_sec=expiry_sec, selftest=selftest)
 
     def _record(self, offer_id: str, amount: Optional[int], result: str) -> None:
         # offer_id can originate from a hostile payer; keep the activity feed
@@ -587,8 +592,12 @@ class ClinkServer(Logger, EventListener):
 
     async def _issue_invoice(self, event: nEvent, offer, amount_sat: int,
                              description: Optional[str] = None, *,
+                             expiry_sec: Optional[int] = None,
                              selftest: bool = False) -> None:
-        expiry = self.invoice_expiry_sec
+        # The caller (dispatch) computes the effective expiry once from the
+        # request (payer's clamped expires_in_seconds, else our default) so the
+        # bolt11, reservation and receipt-registry windows all agree.
+        expiry = int(expiry_sec) if expiry_sec is not None else self.invoice_expiry_sec
         # Honor the payer's requested memo (NIP-69 description), combined with
         # the merchant's offer label, so the invoice carries who-it's-for context
         # (e.g. cashupayserver sends the store name). Capped/sanitized upstream.

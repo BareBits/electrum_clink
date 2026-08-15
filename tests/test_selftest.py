@@ -314,6 +314,7 @@ def test_selftest_payer_registry_and_ttl() -> None:
 class _RecordingWallet:
     def __init__(self) -> None:
         self.deleted: List[str] = []
+        self.created: List[Tuple[int, int]] = []  # (amount_sat, exp_delay)
         self.request = SimpleNamespace(payment_hash=b"\x11" * 32, rhash="11" * 32)
         self.lnworker = SimpleNamespace(
             get_payment_info=lambda payment_hash, direction: SimpleNamespace(),
@@ -321,6 +322,7 @@ class _RecordingWallet:
         )
 
     def create_request(self, amount_sat: int, message: str, exp_delay: int, address) -> str:
+        self.created.append((amount_sat, exp_delay))
         return "reqkey"
 
     def get_request(self, key: str):
@@ -361,13 +363,15 @@ def test_selftest_invoice_leaves_no_side_effects() -> None:
 
     server, wallet, calls = _issue_server()
     asyncio.run(server._issue_invoice(
-        _request_event(), Offer(offer_id="o1", label="L"), 1, None, selftest=True))
+        _request_event(), Offer(offer_id="o1", label="L"), 1, None,
+        expiry_sec=120, selftest=True))
 
     assert calls["responses"] and "bolt11" in calls["responses"][0]  # real invoice went out
     assert calls["devfee"] == []                     # no dev-fee bookkeeping
     assert calls["receipts"] == []                   # no receipt owed
     assert server.reserver.active() == []            # liquidity lock released
     assert wallet.deleted == ["reqkey"]              # wallet request removed
+    assert wallet.created == [(1, 120)]              # expiry threaded to the bolt11
     assert any("self-test" in e["result"] for e in server.recent_activity)
 
 
@@ -376,10 +380,26 @@ def test_normal_invoice_keeps_side_effects() -> None:
 
     server, wallet, calls = _issue_server()
     asyncio.run(server._issue_invoice(
-        _request_event(), Offer(offer_id="o1", label="L"), 5, None, selftest=False))
+        _request_event(), Offer(offer_id="o1", label="L"), 5, None,
+        expiry_sec=120, selftest=False))
 
     assert calls["responses"] and "bolt11" in calls["responses"][0]
     assert calls["devfee"] == ["11" * 32]            # dev fee armed
     assert calls["receipts"] == ["11" * 32]          # receipt remembered
     assert [r.amount_sat for r in server.reserver.active()] == [5]  # lock held
     assert wallet.deleted == []                      # request kept
+    assert wallet.created == [(5, 120)]
+
+
+def test_invoice_honors_passed_expiry_for_bolt11_and_lock() -> None:
+    from clink.offers import Offer
+
+    server, wallet, calls = _issue_server()
+    asyncio.run(server._issue_invoice(
+        _request_event(), Offer(offer_id="o1", label="L"), 7, None,
+        expiry_sec=300, selftest=False))
+
+    assert wallet.created == [(7, 300)]              # bolt11 exp_delay
+    assert server.reserver.active()                  # reservation held
+    assert abs(server.reserver.active()[0].expires_at - (time.time() + 300)) < 2
+    assert calls["receipts"] == ["11" * 32]          # registry window uses it too
