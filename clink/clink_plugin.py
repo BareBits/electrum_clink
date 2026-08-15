@@ -117,6 +117,21 @@ def _offer_price_type(price: Optional[int]) -> OfferPriceType:
     return OfferPriceType.FIXED if _offer_price(price) is not None else OfferPriceType.SPONTANEOUS
 
 
+def _offer_expires_at(expires_in: Optional[int]) -> int:
+    """The absolute epoch expiry for an offer with a ``expires_in`` lifetime.
+
+    ``None``/``0`` means "never expires" (``0``). ``expires_in`` must be a
+    positive number of seconds; anything else is rejected before it can be
+    stored so a stored offer always has a sane ``expires_at``.
+    """
+    if expires_in is None or expires_in == 0:
+        return 0
+    if isinstance(expires_in, bool) or not isinstance(expires_in, int) or expires_in < 1:
+        raise UserFacingException(
+            "Offer expiry must be a positive number of seconds.")
+    return int(time.time()) + expires_in
+
+
 class ClinkServer(Logger, EventListener):
     """Owns the relay connection and request-handling loop for one wallet."""
 
@@ -248,6 +263,19 @@ class ClinkServer(Logger, EventListener):
             price_type=offer.price_type if offer else OfferPriceType.SPONTANEOUS,
             price=offer.price if offer else None,
         ))
+
+    def _noffer_for(self, offer_id: str) -> Optional[str]:
+        """The noffer for ``offer_id`` if it is still payable, else ``None``.
+
+        Injected into the protocol as the ``latest`` resolver for code-3
+        responses: a replacement offer only ever surfaces to the payer while it
+        is actually usable (exists, active, not yet expired), so ``latest`` can
+        never forward a payer to another broken offer.
+        """
+        offer = self.offers.get(offer_id)
+        if offer is None or not offer.active or protocol.offer_expired(offer):
+            return None
+        return self.make_noffer(offer_id)
 
     async def _liveness_probe(self, relay: str) -> ProbeResult:
         """Probe callable injected into the liveness monitor (fresh proxy each run)."""
@@ -586,7 +614,8 @@ class ClinkServer(Logger, EventListener):
         selftest = self.is_selftest_payer(event.pubkey)
         offer_id = protocol.request_offer_id(req)
         offer = self.offers.get(offer_id) if offer_id is not None else None
-        resolution = protocol.resolve_request(req, offer, self.reserver.available_sat())
+        resolution = protocol.resolve_request(
+            req, offer, self.reserver.available_sat(), noffer_for=self._noffer_for)
         if isinstance(resolution, protocol.SendError):
             self._record(offer_id or "", protocol.request_amount_sat(req),
                          f"error {resolution.payload.get('code')}"
@@ -967,20 +996,23 @@ class ClinkPlugin(BasePlugin):
     # --- API used by cmdline + Qt ----------------------------------------
 
     async def create_offer(self, label: str = "", allow_payer_memo: bool = True,
-                           relay: str = "", price: Optional[int] = None) -> Dict[str, Any]:
+                           relay: str = "", price: Optional[int] = None,
+                           expires_in: Optional[int] = None) -> Dict[str, Any]:
         """Create an offer; ``relay`` (``wss://…``) pins a custom relay instead
         of the automatic pick. ``price`` (positive sats) turns it into a fixed-
         price offer whose noffer advertises TLV 3/4 and whose invoices are always
         minted at exactly that amount; ``None`` keeps it spontaneous. Either way
         the relay is payability-probed first and a failing probe *blocks*
         creation, and the chosen relay is pinned onto the offer so the noffer
-        handed to payers never changes across restarts."""
+        handed to payers never changes across restarts. ``expires_in`` (seconds)
+        sets an absolute ``expires_at`` on the offer: past it, payers get a
+        code-3 "expired" response instead of an invoice."""
         assert self.server is not None, "wallet not loaded yet"
         custom_relay = (relay or "").strip()
         if custom_relay:
             return await self._create_offer_custom_relay(
                 custom_relay, label=label, allow_payer_memo=allow_payer_memo,
-                price=price)
+                price=price, expires_in=expires_in)
         # Probe (cached 24h) before building the noffer so its single embedded
         # relay is one a payer can actually reach — see clink.relay_probe.
         selection = await self.server.pick_payable_relay()
@@ -997,7 +1029,8 @@ class ClinkPlugin(BasePlugin):
         offer = self.server.offers.create(
             label=label, allow_payer_memo=allow_payer_memo,
             price_type=_offer_price_type(price), price=_offer_price(price),
-            relay=selection.relay, relay_custom=False)
+            relay=selection.relay, relay_custom=False,
+            expires_at=_offer_expires_at(expires_in))
         if needs_listener:
             self.server.restart_event_handler()
         return {
@@ -1007,11 +1040,13 @@ class ClinkPlugin(BasePlugin):
             "noffer": self.server.make_noffer(offer.offer_id),
             "relay": offer.relay,
             "relay_payable": True,
+            "expires_at": offer.expires_at,
         }
 
     async def _create_offer_custom_relay(self, relay: str, *, label: str,
                                          allow_payer_memo: bool,
-                                         price: Optional[int] = None) -> Dict[str, Any]:
+                                         price: Optional[int] = None,
+                                         expires_in: Optional[int] = None) -> Dict[str, Any]:
         assert self.server is not None
         relay = normalize_relay_url(relay)  # ValueError on a malformed URL
         probe = await self.server.probe_custom_relay(relay)
@@ -1026,7 +1061,8 @@ class ClinkPlugin(BasePlugin):
         offer = self.server.offers.create(
             label=label, allow_payer_memo=allow_payer_memo,
             price_type=_offer_price_type(price), price=_offer_price(price),
-            relay=relay, relay_custom=True)
+            relay=relay, relay_custom=True,
+            expires_at=_offer_expires_at(expires_in))
         if needs_listener:
             self.server.restart_event_handler()
         return {
@@ -1036,6 +1072,7 @@ class ClinkPlugin(BasePlugin):
             "noffer": self.server.make_noffer(offer.offer_id),
             "relay": relay,
             "relay_payable": True,
+            "expires_at": offer.expires_at,
         }
 
     def list_offers(self) -> Dict[str, Any]:
@@ -1051,7 +1088,9 @@ class ClinkPlugin(BasePlugin):
                              "relay_custom": o.relay_custom,
                              # False only for a pre-pinning legacy offer whose
                              # relay is still re-derived from the config order.
-                             "relay_pinned": bool(o.relay.strip())}
+                             "relay_pinned": bool(o.relay.strip()),
+                             "expires_at": o.expires_at,
+                             "replaced_by": o.replaced_by}
                 for o in self.server.offers.list()}
 
     def candidate_relay_urls(self) -> List[str]:
@@ -1076,6 +1115,16 @@ class ClinkPlugin(BasePlugin):
         if removed and set(self.server.listen_relay_urls()) != before:
             self.server.restart_event_handler()
         return removed
+
+    def replace_offer(self, offer_id: str, replacement_id: str) -> bool:
+        """Move ``offer_id`` onto ``replacement_id``: the outgoing offer stops
+        answering and requests for it get a code-3 response carrying a
+        ``latest`` noffer pointing at the replacement (see the spec), so a
+        payer holding the stale noffer updates and retries."""
+        assert self.server is not None, "wallet not loaded yet"
+        if not self.server.offers.replace_with(offer_id, replacement_id):
+            return False
+        return self.server.offers.set_active(offer_id, False)
 
     async def check_noffers(self, offer_id: Optional[str] = None) -> Dict[str, Any]:
         """Self-test the noffer of one offer (or all offers) end to end.

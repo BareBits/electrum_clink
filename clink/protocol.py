@@ -2,18 +2,20 @@
 
 The wire payloads (NIP-44-decrypted JSON) and the decision of *what* to reply are
 kept here, free of any relay or Electrum I/O, so the core policy — offer lookup,
-fixed/spontaneous amount handling and the inbound-liquidity gate — is unit-testable.
+expiry/replacement, fixed/spontaneous amount handling and the inbound-liquidity
+gate — is unit-testable.
 
 Request  (payer -> us):  {"offer", "amount_sats"?, "zap"?, "payer_data"?, "expires_in_seconds"?, "description"?}
 Success  (us -> payer):  {"bolt11": "..."}
-Error    (us -> payer):  {"code": int, "error": str, "range"?: {"min","max"}}
+Error    (us -> payer):  {"code": int, "error": str, "range"?: {"min","max"}, "latest"?: noffer}
 Receipt  (us -> payer):  {"res": "ok", "preimage"?}
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 from .noffer import OfferPriceType
 from .offers import Offer
@@ -24,6 +26,11 @@ ERR_TEMPORARY_FAILURE = 2
 ERR_EXPIRED_OFFER = 3
 ERR_UNSUPPORTED_FEATURE = 4
 ERR_INVALID_AMOUNT = 5
+
+# A replacement noffer provider receives the replacement offer id and returns
+# its ``noffer1...`` string when the replacement is usable, else ``None`` (so a
+# ``latest`` pointer is never handed out to a dead or also-expired offer).
+NofferProvider = Callable[[str], Optional[str]]
 
 
 def error_payload(code: int, message: str, **extra: Any) -> Dict[str, Any]:
@@ -249,20 +256,79 @@ def fixed_offer_price_sat(offer: Offer, min_sat: int = 1) -> Optional[int]:
     return price
 
 
+def offer_expired(offer: Offer, now: Optional[int] = None) -> bool:
+    """Whether ``offer`` is past its configured ``expires_at`` (epoch seconds).
+
+    An offer without a sane expiry never expires. ``now`` may be injected for
+    deterministic tests; it defaults to the wall clock.
+    """
+    expires_at = getattr(offer, "expires_at", None)
+    if isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at <= 0:
+        return False
+    return int(now if now is not None else time.time()) >= expires_at
+
+
+def replacement_noffer(offer: Offer, provider: Optional[NofferProvider]) -> Optional[str]:
+    """The noffer a payer should be pointed at when ``offer`` is no longer usable.
+
+    Uses ``offer.replaced_by`` (a replacement offer id) and the injected
+    ``provider``, which is responsible for returning ``None`` when the
+    replacement does not exist or is itself dead — so ``latest`` never forwards
+    a payer to another broken offer. ``None`` when no replacement is set.
+    """
+    replaced_by = (getattr(offer, "replaced_by", "") or "").strip()
+    if not replaced_by or provider is None:
+        return None
+    try:
+        return provider(replaced_by)
+    except Exception:
+        return None
+
+
+def expired_offer_payload(offer: Offer, provider: Optional[NofferProvider]) -> Dict[str, Any]:
+    """The code-3 response for an expired/replaced/moved offer.
+
+    Carries ``latest`` (the replacement's noffer) when one is configured,
+    following the spec: a client that sees ``latest`` updates its stored offer
+    and retries automatically; without it the offer is permanently expired.
+    """
+    latest = replacement_noffer(offer, provider)
+    if latest:
+        return error_payload(
+            ERR_EXPIRED_OFFER, "Offer has been replaced or moved.", latest=latest)
+    return error_payload(ERR_EXPIRED_OFFER, "Offer has expired.")
+
+
 def resolve_request(
     req: Dict[str, Any],
     offer: Optional[Offer],
     available_sat: int,
     *,
     min_sat: int = 1,
+    now: Optional[int] = None,
+    noffer_for: Optional[NofferProvider] = None,
 ) -> Resolution:
     """Decide how to answer a decrypted offer request.
 
     ``available_sat`` is receivable capacity *after* existing reservations, so
-    the amount check here is also the inbound-liquidity lock gate.
+    the amount check here is also the inbound-liquidity lock gate. ``now`` and
+    ``noffer_for`` are injected for testability: the former pins the clock the
+    expiry check runs against, the latter resolves ``offer.replaced_by`` to a
+    ``latest`` noffer for code-3 responses.
     """
-    if offer is None or not offer.active:
+    if offer is None:
         return SendError(error_payload(ERR_INVALID_OFFER, "Unknown or inactive offer"))
+
+    if not offer.active:
+        # Deliberately disabled: still "invalid" unless it points somewhere new,
+        # in which case it is a *moved* offer (code 3 with latest).
+        if replacement_noffer(offer, noffer_for) is None:
+            return SendError(error_payload(ERR_INVALID_OFFER, "Unknown or inactive offer"))
+        return SendError(expired_offer_payload(offer, noffer_for))
+
+    if offer_expired(offer, now):
+        # Past its configured expiry: renewed offers point at their replacement.
+        return SendError(expired_offer_payload(offer, noffer_for))
 
     if offer.price_type == OfferPriceType.FIXED:
         # The merchant fixed the price; a payer may omit the amount (the spec

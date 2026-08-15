@@ -5,6 +5,7 @@ from __future__ import annotations
 from clink.noffer import OfferPriceType
 from clink.offers import Offer
 from clink.protocol import (
+    ERR_EXPIRED_OFFER,
     ERR_INVALID_AMOUNT,
     ERR_INVALID_OFFER,
     ERR_UNSUPPORTED_FEATURE,
@@ -43,6 +44,85 @@ def test_unknown_offer() -> None:
 def test_inactive_offer() -> None:
     res = resolve_request({"amount_sats": 1000}, _offer(active=False), available_sat=100_000)
     assert isinstance(res, SendError) and res.payload["code"] == ERR_INVALID_OFFER
+
+
+def test_expired_offer_is_code_3() -> None:
+    # An offer past its configured expiry is *expired* (code 3), not invalid.
+    res = resolve_request({"amount_sats": 1000},
+                          _offer(expires_at=1000), available_sat=100_000, now=1001)
+    assert isinstance(res, SendError)
+    assert res.payload["code"] == ERR_EXPIRED_OFFER
+    assert "latest" not in res.payload
+
+
+def test_expired_offer_without_expiry_never_expires() -> None:
+    # expires_at 0/absent -> no time-based expiry, ever.
+    for kw in ({}, {"expires_at": 0}, {"expires_at": -1}):
+        res = resolve_request({"amount_sats": 1000}, _offer(**kw),
+                              available_sat=100_000, now=10 ** 12)
+        assert isinstance(res, IssueInvoice)
+
+
+def test_expired_exactly_at_boundary_is_code_3() -> None:
+    res = resolve_request({"amount_sats": 1000},
+                          _offer(expires_at=1000), available_sat=100_000, now=1000)
+    assert isinstance(res, SendError) and res.payload["code"] == ERR_EXPIRED_OFFER
+    res = resolve_request({"amount_sats": 1000},
+                          _offer(expires_at=1000), available_sat=100_000, now=999)
+    assert isinstance(res, IssueInvoice)
+
+
+def test_replaced_offer_is_code_3_with_latest() -> None:
+    # A replaced offer is *moved*: code 3 carries the replacement's noffer.
+    provider = {"new": "noffer1q...new"}
+    res = resolve_request({"amount_sats": 1000},
+                          _offer(active=False, replaced_by="new"),
+                          available_sat=100_000, noffer_for=lambda oid: provider.get(oid))
+    assert isinstance(res, SendError)
+    assert res.payload["code"] == ERR_EXPIRED_OFFER
+    assert res.payload["latest"] == "noffer1q...new"
+
+
+def test_replaced_offer_with_dead_replacement_stays_invalid() -> None:
+    # The provider refuses (replacement missing/dead/expired) -> no latest;
+    # a deliberately disabled offer with nowhere to go is plain invalid.
+    res = resolve_request({"amount_sats": 1000},
+                          _offer(active=False, replaced_by="new"),
+                          available_sat=100_000, noffer_for=lambda oid: None)
+    assert isinstance(res, SendError)
+    assert res.payload["code"] == ERR_INVALID_OFFER
+    assert "latest" not in res.payload
+
+
+def test_no_latest_when_no_replacement_configured() -> None:
+    res = resolve_request({"amount_sats": 1000},
+                          _offer(expires_at=1000),
+                          available_sat=100_000, now=1001,
+                          noffer_for=lambda oid: "noffer1q...x")
+    assert isinstance(res, SendError)
+    assert res.payload["code"] == ERR_EXPIRED_OFFER
+    assert "latest" not in res.payload
+
+
+def test_expired_offer_with_live_replacement_points_at_it() -> None:
+    provider = {"new": "noffer1q...new"}
+    res = resolve_request({"amount_sats": 1000},
+                          _offer(expires_at=1000, replaced_by="new"),
+                          available_sat=100_000, now=1001,
+                          noffer_for=lambda oid: provider.get(oid))
+    assert isinstance(res, SendError)
+    assert res.payload["code"] == ERR_EXPIRED_OFFER
+    assert res.payload["latest"] == "noffer1q...new"
+
+
+def test_provider_exceptions_swallowed_into_no_latest() -> None:
+    def boom(oid: str) -> str:
+        raise RuntimeError("no relay access in the policy layer")
+    res = resolve_request({"amount_sats": 1000},
+                          _offer(active=False, replaced_by="new"),
+                          available_sat=100_000, noffer_for=boom)
+    assert isinstance(res, SendError)
+    assert res.payload["code"] == ERR_INVALID_OFFER
 
 
 def test_spontaneous_happy_path() -> None:

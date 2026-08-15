@@ -249,3 +249,45 @@ def test_pinned_relay_survives_selection_loss() -> None:
     assert listed["relay_pinned"] is True
     assert listed["relay_custom"] is False
     assert listed["noffer"] == result["noffer"]
+
+
+# --- offer expiry and replacement --------------------------------------------
+
+def test_create_offer_without_expiry_never_expires() -> None:
+    plugin, server, _events = _plugin(_selection(ok=True))
+    for kw in ({}, {"expires_in": 0}, {"expires_in": None}):
+        result = _run(plugin.create_offer(label="x", **kw))
+        assert result["expires_at"] == 0
+        assert server.offers.get(result["offer_id"]).expires_at == 0
+
+
+def test_create_offer_with_expiry_sets_absolute_expires_at() -> None:
+    plugin, server, _events = _plugin(_selection(ok=True))
+    before = time.time()
+    result = _run(plugin.create_offer(label="x", expires_in=3600))
+    assert server.offers.get(result["offer_id"]).expires_at == result["expires_at"]
+    assert result["expires_at"] >= int(before) + 3600
+    # the offer's expiry is persisted, not just reported
+    assert result["expires_at"] == plugin.list_offers()[result["offer_id"]]["expires_at"]
+
+
+def test_create_offer_expiry_validation() -> None:
+    plugin, server, _events = _plugin(_selection(ok=True))
+    for bad in (-5, 0.5, True, "3600"):
+        with pytest.raises(UserFacingException, match="expiry"):
+            _run(plugin.create_offer(label="x", expires_in=bad))
+    assert server.offers.list() == []
+
+
+def test_replace_offer_retires_old_and_links_to_new() -> None:
+    plugin, server, _events = _plugin(_selection(ok=True))
+    old = server.offers.create(label="old")
+    new = server.offers.create(label="new")
+    assert plugin.replace_offer(old.offer_id, new.offer_id) is True
+    listed = plugin.list_offers()
+    assert listed[old.offer_id]["active"] is False
+    assert listed[old.offer_id]["replaced_by"] == new.offer_id
+    assert listed[new.offer_id]["active"] is True
+    assert listed[new.offer_id]["replaced_by"] == ""
+    assert plugin.replace_offer("ghost", new.offer_id) is False
+    assert plugin.replace_offer(old.offer_id, "ghost") is False

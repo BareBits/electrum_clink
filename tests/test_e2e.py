@@ -243,6 +243,38 @@ def test_fixed_offer_invoice_and_amount_validation(rig) -> None:
     assert resp["range"] == {"min": 420, "max": 420}
 
 
+def test_moved_offer_answers_code_3_with_latest(rig) -> None:
+    """After ``clink_replace_offer old new``, a request for the retired offer
+    answers code 3 (Expired or Moved) carrying ``latest`` = the replacement's
+    noffer, so a payer holding the stale noffer updates and retries."""
+    from clink.noffer import noffer_decode
+
+    old = json.loads(_electrum_cli("clink_add_offer", "--label", "e2e-old"))
+    new = json.loads(_electrum_cli("clink_add_offer", "--label", "e2e-new"))
+    out = _electrum_cli("clink_replace_offer", old["offer_id"], new["offer_id"])
+    assert "moved" in out, out
+
+    resp = asyncio.run(request_invoice(old["noffer"], amount_sats=1000, timeout=30))
+    assert resp.get("code") == 3, resp
+    latest = resp.get("latest")
+    assert latest, resp
+    assert noffer_decode(latest).offer == new["offer_id"]
+    # the replacement offer itself still works
+    assert noffer_decode(new["noffer"]).offer == new["offer_id"]
+
+
+def test_expired_offer_answers_code_3(rig) -> None:
+    """An offer created with an expiry answers code 3 (Expired) once past it,
+    with no ``latest`` pointer."""
+    created = json.loads(_electrum_cli(
+        "clink_add_offer", "--label", "e2e-expiring", "--expires-in", "1"))
+    assert created["expires_at"] > 0, created
+    time.sleep(2)  # wait out the 1-second lifetime
+    resp = asyncio.run(request_invoice(created["noffer"], amount_sats=1000, timeout=30))
+    assert resp.get("code") == 3, resp
+    assert "latest" not in resp, resp
+
+
 def test_payment_receipt_delivered_after_payment(rig) -> None:
     # Full round trip: request -> invoice -> pay it from LND -> the plugin should
     # send the payer a kind-21001 {"res":"ok","preimage":...} receipt (CLINK

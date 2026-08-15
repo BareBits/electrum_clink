@@ -117,7 +117,8 @@ SimpleConfig.CLINK_DEVFEE_NOTICE_SHOWN = ConfigVar(
 
 @plugin_command("", plugin_name)
 async def add_offer(self: "Commands", label: str = "", allow_payer_memo: bool = True,
-                    relay: str = "", price: int = 0, plugin: "ClinkPlugin" = None) -> dict:
+                    relay: str = "", price: int = 0, expires_in: int = 0,
+                    plugin: "ClinkPlugin" = None) -> dict:
     """
     Create a new offer and return its noffer string.
 
@@ -125,8 +126,27 @@ async def add_offer(self: "Commands", label: str = "", allow_payer_memo: bool = 
     arg:bool:allow_payer_memo:whether a payer's requested memo is folded into the invoice (default true)
     arg:str:relay:custom relay URL (wss://myrelay.com:port) the noffer advertises; omit for automatic selection. Either way the relay is probed first (a failing probe blocks creation) and pinned to the offer, so its noffer never changes across restarts.
     arg:int:price:fixed price in sats (omit or 0 for a spontaneous offer whose amount the payer chooses)
+    arg:int:expires_in:offer lifetime in seconds (omit or 0 for no expiry). Past it, payers get a code-3 "expired" response.
     """
-    return await plugin.create_offer(label, allow_payer_memo, relay, price or None)
+    return await plugin.create_offer(
+        label, allow_payer_memo, relay, price or None,
+        expires_in=expires_in or None)
+
+
+@plugin_command("", plugin_name)
+async def replace_offer(self: "Commands", offer_id: str, replacement_id: str,
+                        plugin: "ClinkPlugin" = None) -> str:
+    """
+    Move one offer onto another: the outgoing offer stops answering and requests
+    for it reply with a code-3 "moved" error carrying the replacement's noffer,
+    so payers holding the stale noffer update and retry automatically.
+
+    arg:str:offer_id:the offer to retire, see list_offers
+    arg:str:replacement_id:the offer to redirect payers to
+    """
+    ok = plugin.replace_offer(offer_id, replacement_id)
+    return f"{offer_id} moved to {replacement_id}" if ok else "no such offer id"
+
 
 
 @plugin_command("", plugin_name)

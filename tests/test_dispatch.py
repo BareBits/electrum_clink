@@ -206,6 +206,126 @@ def test_fixed_offer_rejects_differing_amount_at_dispatch() -> None:
         "range": {"min": 25000, "max": 25000}}]
 
 
+# --- offer expiry and replacement (code 3 with latest) ------------------------
+
+def _replacement_dispatch_server() -> Tuple[Any, Dict[str, List[Any]]]:
+    """``_dispatch_server`` + a replaced offer (o1 -> o2) and a live o2.
+
+    ``_noffer_for`` runs for real (it is a real method on the shell), so the
+    code-3 ``latest`` field is a genuinely encoded noffer for o2.
+    """
+    from electrum.logging import Logger
+
+    server = ClinkServer.__new__(ClinkServer)
+    Logger.__init__(server)
+    server_sk = PrivateKey()
+    server.private_key = server_sk
+    server.pubkey_hex = server_sk.public_key.hex()
+    server._seen_events = OrderedDict()
+    server.recent_activity = deque(maxlen=50)
+    server._selftest_payers = {}
+    server.config = SimpleNamespace(CLINK_INVOICE_EXPIRY=120)
+    offers = {
+        "o1": Offer(offer_id="o1", label="old", active=False, replaced_by="o2"),
+        "o2": Offer(offer_id="o2", label="new"),
+    }
+    server.offers = SimpleNamespace(get=lambda oid: offers.get(oid))
+    server.offer_relay = lambda offer: "wss://relay.example"  # type: ignore[method-assign]
+    server.reserver = SimpleNamespace(available_sat=lambda: 100_000)
+    server.receipts = SimpleNamespace(pending_count_for=lambda pub: 0)
+
+    calls: Dict[str, List[Any]] = {"responses": [], "issued": []}
+
+    async def send_response(event: Any, payload: Dict[str, Any]) -> None:
+        calls["responses"].append(payload)
+
+    async def issue_invoice(event: Any, offer: Any, amount_sat: int,
+                            description: Optional[str] = None, *,
+                            expiry_sec: Optional[int] = None,
+                            selftest: bool = False) -> None:
+        calls["issued"].append((amount_sat, description, expiry_sec, selftest))
+
+    server.send_response = send_response  # type: ignore[method-assign]
+    server._issue_invoice = issue_invoice  # type: ignore[method-assign]
+    return server, calls
+
+
+def test_moved_offer_answers_code_3_with_latest_noffer() -> None:
+    server, calls = _replacement_dispatch_server()
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1", "amount_sats": 500}))
+    assert calls["issued"] == []
+    assert len(calls["responses"]) == 1
+    payload = calls["responses"][0]
+    assert payload["code"] == protocol.ERR_EXPIRED_OFFER
+    # latest is a real, decodable noffer pointing at the replacement offer.
+    assert payload["latest"].startswith("noffer1q")
+    from clink.noffer import noffer_decode
+    assert noffer_decode(payload["latest"]).offer == "o2"
+
+
+def test_expired_offer_answers_code_3_without_latest() -> None:
+    from electrum.logging import Logger
+
+    server = ClinkServer.__new__(ClinkServer)
+    Logger.__init__(server)
+    server_sk = PrivateKey()
+    server.private_key = server_sk
+    server.pubkey_hex = server_sk.public_key.hex()
+    server._seen_events = OrderedDict()
+    server.recent_activity = deque(maxlen=50)
+    server._selftest_payers = {}
+    server.config = SimpleNamespace(CLINK_INVOICE_EXPIRY=120)
+    server.offers = SimpleNamespace(
+        get=lambda oid: Offer(offer_id="o1", expires_at=int(time.time()) - 1)
+        if oid == "o1" else None)
+    server.reserver = SimpleNamespace(available_sat=lambda: 100_000)
+    server.receipts = SimpleNamespace(pending_count_for=lambda pub: 0)
+
+    calls: Dict[str, List[Any]] = {"responses": [], "issued": []}
+
+    async def send_response(event: Any, payload: Dict[str, Any]) -> None:
+        calls["responses"].append(payload)
+
+    async def issue_invoice(event: Any, offer: Any, amount_sat: int,
+                            description: Optional[str] = None, *,
+                            expiry_sec: Optional[int] = None,
+                            selftest: bool = False) -> None:
+        calls["issued"].append((amount_sat, description, expiry_sec, selftest))
+
+    server.send_response = send_response  # type: ignore[method-assign]
+    server._issue_invoice = issue_invoice  # type: ignore[method-assign]
+
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1", "amount_sats": 500}))
+    assert calls["issued"] == []
+    assert calls["responses"] == [{"code": protocol.ERR_EXPIRED_OFFER, "error": "Offer has expired."}]
+
+
+def test_inactive_offer_with_dead_replacement_stays_invalid() -> None:
+    server, calls = _replacement_dispatch_server()
+    # Drop o2: o1's replacement no longer exists, so latest must not be sent.
+    server.offers = SimpleNamespace(
+        get=lambda oid: Offer(offer_id="o1", active=False, replaced_by="o2")
+        if oid == "o1" else None)
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1", "amount_sats": 500}))
+    assert calls["issued"] == []
+    assert calls["responses"] == [{"code": protocol.ERR_INVALID_OFFER,
+                                   "error": "Unknown or inactive offer"}]
+
+
+def test_expired_offer_with_live_replacement_is_still_a_move() -> None:
+    server, calls = _replacement_dispatch_server()
+    # Time-based expiry rather than disablement: still points at the replacement.
+    server.offers = SimpleNamespace(
+        get=lambda oid: Offer(offer_id="o1", active=True,
+                              expires_at=int(time.time()) - 1, replaced_by="o2")
+        if oid == "o1" else Offer(offer_id="o2"))
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1", "amount_sats": 500}))
+    assert calls["issued"] == []
+    assert len(calls["responses"]) == 1
+    assert calls["responses"][0]["code"] == protocol.ERR_EXPIRED_OFFER
+    assert calls["responses"][0]["latest"].startswith("noffer1q")
+
+
 # --- freshness clamps ---------------------------------------------------------
 
 def test_stale_request_dropped() -> None:

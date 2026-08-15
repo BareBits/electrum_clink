@@ -45,6 +45,16 @@ class Offer:
     # True when ``relay`` was chosen explicitly by the user rather than pinned
     # from the automatic payability probe (display-only distinction).
     relay_custom: bool = False
+    # Epoch seconds after which the offer stops being payable (``0``/absent =
+    # never). Mirrors the offer's expiry in the offers store so a payer holding
+    # a stale noffer gets a code-3 "expired" response instead of a silent
+    # liquidity error. Set at creation; extended when an offer is renewed.
+    expires_at: int = 0
+    # Offer id of the offer that replaced this one. An offer with a replacement
+    # is *moved*: requests for it answer code 3 with a ``latest`` noffer so the
+    # payer can update and retry. Never enforced by the store itself; it is
+    # purely descriptive metadata driving the code-3 path.
+    replaced_by: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -65,6 +75,8 @@ class Offer:
             # Offers stored before this flag existed could only carry a
             # non-empty relay if the user chose it explicitly.
             relay_custom=bool(d.get("relay_custom", bool(d.get("relay", "")))),
+            expires_at=d.get("expires_at", 0),
+            replaced_by=d.get("replaced_by", ""),
         )
 
 
@@ -137,7 +149,8 @@ class OfferStore:
                price: Optional[int] = None,
                allow_payer_memo: bool = True,
                relay: str = "",
-               relay_custom: bool = False) -> Offer:
+               relay_custom: bool = False,
+               expires_at: int = 0) -> Offer:
         offer = Offer(
             offer_id=_new_offer_id(),
             label=label,
@@ -147,6 +160,7 @@ class OfferStore:
             allow_payer_memo=allow_payer_memo,
             relay=relay.strip(),
             relay_custom=bool(relay_custom) and bool(relay.strip()),
+            expires_at=expires_at,
         )
         self._offers[offer.offer_id] = offer
         self._persist()
@@ -206,5 +220,36 @@ class OfferStore:
         if offer is None:
             return False
         offer.allow_payer_memo = bool(allow)
+        self._persist()
+        return True
+
+    def set_expires_at(self, offer_id: str, expires_at: int) -> bool:
+        """Set an offer's absolute expiry (epoch seconds; ``0`` = never)."""
+        offer = self._offers.get(offer_id)
+        if offer is None:
+            return False
+        offer.expires_at = expires_at
+        self._persist()
+        return True
+
+    def set_replaced_by(self, offer_id: str, replaced_by: str) -> bool:
+        """Point ``offer_id`` at its replacement (empty string clears it)."""
+        offer = self._offers.get(offer_id)
+        if offer is None:
+            return False
+        offer.replaced_by = (replaced_by or "").strip()
+        self._persist()
+        return True
+
+    def replace_with(self, offer_id: str, replacement_id: str) -> bool:
+        """Mark ``offer_id`` as replaced by ``replacement_id`` and persist.
+
+        ``replacement_id`` must already be in the store; the outgoing offer
+        inherits nothing beyond the code-3 ``latest`` link. Returns ``False``
+        when either id is unknown.
+        """
+        if offer_id not in self._offers or replacement_id not in self._offers:
+            return False
+        self._offers[offer_id].replaced_by = replacement_id
         self._persist()
         return True

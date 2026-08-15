@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from electrum.gui.common_qt.util import paintQR
 from electrum.gui.qt.util import (
@@ -562,6 +563,28 @@ class ClinkTab(QWidget):
             tooltip += f"\n{result.detail}"
         return text, tooltip
 
+    def _retired_state(self, item: Any) -> Optional[Tuple[str, str]]:
+        """(text, tooltip) when this offer is moved or expired, else ``None``.
+
+        A replaced offer stopped answering and points its payers at a new
+        noffer; a time-expired offer answers code 3 with no pointer. Either
+        state is surfaced in the status column ahead of any self-test result,
+        since the check would only confirm the expiry.
+        """
+        info = self.plugin.list_offers().get(item.data(COL_LABEL, OFFER_ID_ROLE))
+        if not info:
+            return None
+        if info.get("replaced_by"):
+            return (_("→ moved"), _(
+                "This offer is retired and redirects payers to its replacement "
+                "noffer automatically (code 3, 'latest')."))
+        expires_at = info.get("expires_at") or 0
+        if expires_at and expires_at <= int(time.time()):
+            return (_("✗ expired"), _(
+                "This offer passed its expiry time; payers get a code-3 "
+                "'expired' response and no invoice."))
+        return None
+
     def _refresh_check_column(self) -> None:
         results = self.plugin.noffer_check_results()
         self.check_btn.setText(
@@ -570,7 +593,11 @@ class ClinkTab(QWidget):
         for i in range(self.offers_list.topLevelItemCount()):
             item = self.offers_list.topLevelItem(i)
             offer_id = item.data(COL_LABEL, OFFER_ID_ROLE)
-            text, tooltip = self._status_cell(results.get(offer_id))
+            retired = self._retired_state(item)
+            if retired is not None:
+                text, tooltip = retired
+            else:
+                text, tooltip = self._status_cell(results.get(offer_id))
             if item.text(COL_STATUS) != text:
                 item.setText(COL_STATUS, text)
             item.setToolTip(COL_STATUS, tooltip)
@@ -659,6 +686,16 @@ class ClinkTab(QWidget):
                 item = QTreeWidgetItem(
                     [info["label"], "", offer_id, price_text, info["noffer"],
                      info.get("relay", ""), ""])
+                expires_at = info.get("expires_at") or 0
+                if expires_at:
+                    when = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M")
+                    price_tooltip += "\n" + _(
+                        "This offer expires at {}; payers get a code-3 'expired' "
+                        "response afterwards.").format(when)
+                if info.get("replaced_by"):
+                    price_tooltip += "\n" + _(
+                        "This offer is retired and redirects payers to its "
+                        "replacement noffer (code 3, 'latest').")
                 item.setToolTip(COL_PRICE, price_tooltip)
                 item.setData(COL_LABEL, OFFER_ID_ROLE, offer_id)
                 if info.get("relay_custom"):
