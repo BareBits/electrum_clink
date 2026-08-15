@@ -71,9 +71,9 @@ def normalize_relay_url(url: str) -> str:
     if not parts.hostname:
         raise ValueError(f"relay URL has no host: {candidate!r}")
     try:
-        parts.port  # the property raises ValueError on a malformed port
+        _ = parts.port  # the property raises ValueError on a malformed port
     except ValueError:
-        raise ValueError(f"relay URL has an invalid port: {candidate!r}")
+        raise ValueError(f"relay URL has an invalid port: {candidate!r}") from None
     return candidate
 
 

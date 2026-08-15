@@ -38,7 +38,6 @@ from clink.clink_plugin import (
 )
 from clink.offers import Offer
 
-
 # --- harness -----------------------------------------------------------------
 
 def _dispatch_server() -> Tuple[Any, Dict[str, List[Any]]]:
@@ -58,6 +57,7 @@ def _dispatch_server() -> Tuple[Any, Dict[str, List[Any]]]:
     server._seen_events = OrderedDict()
     server.recent_activity = deque(maxlen=50)
     server._selftest_payers = {}
+    server.config = SimpleNamespace(CLINK_INVOICE_EXPIRY=120)
     offer = Offer(offer_id="o1", label="L")
     server.offers = SimpleNamespace(get=lambda oid: offer if oid == "o1" else None)
     server.reserver = SimpleNamespace(available_sat=lambda: 100_000)
@@ -70,8 +70,10 @@ def _dispatch_server() -> Tuple[Any, Dict[str, List[Any]]]:
 
     async def issue_invoice(event: Any, offer: Any, amount_sat: int,
                             description: Optional[str] = None, *,
-                            selftest: bool = False) -> None:
-        calls["issued"].append((amount_sat, description, selftest))
+                            expiry_sec: Optional[int] = None,
+                            selftest: bool = False,
+                            zap_raw: Optional[str] = None) -> None:
+        calls["issued"].append((amount_sat, description, expiry_sec, selftest, zap_raw))
 
     server.send_response = send_response  # type: ignore[method-assign]
     server._issue_invoice = issue_invoice  # type: ignore[method-assign]
@@ -104,8 +106,228 @@ VALID_REQ = {"offer": "o1", "amount_sats": 500}
 def test_valid_request_issues_invoice() -> None:
     server, calls = _dispatch_server()
     _dispatch(server, _request_event(server, PrivateKey(), VALID_REQ))
-    assert calls["issued"] == [(500, None, False)]
+    assert calls["issued"] == [(500, None, 120, False, None)]
     assert calls["responses"] == []
+
+
+# --- requested invoice expiry (expires_in_seconds) ----------------------------
+
+def test_payer_requested_expiry_is_honored() -> None:
+    server, calls = _dispatch_server()
+    req = dict(VALID_REQ, expires_in_seconds=300)
+    _dispatch(server, _request_event(server, PrivateKey(), req))
+    assert calls["issued"] == [(500, None, 300, False, None)]
+
+
+def test_payer_requested_expiry_is_clamped_to_cap() -> None:
+    # A hostile/errored request must never pin inbound liquidity for longer
+    # than the protocol cap, no matter how large expires_in_seconds is.
+    server, calls = _dispatch_server()
+    req = dict(VALID_REQ, expires_in_seconds=protocol.MAX_INVOICE_EXPIRY_SEC + 7 * 24 * 3600)
+    _dispatch(server, _request_event(server, PrivateKey(), req))
+    assert calls["issued"] == [(500, None, protocol.MAX_INVOICE_EXPIRY_SEC, False, None)]
+
+
+def test_payer_requested_expiry_is_clamped_to_floor() -> None:
+    server, calls = _dispatch_server()
+    req = dict(VALID_REQ, expires_in_seconds=1)  # unpayably short
+    _dispatch(server, _request_event(server, PrivateKey(), req))
+    assert calls["issued"] == [(500, None, protocol.MIN_INVOICE_EXPIRY_SEC, False, None)]
+
+
+def test_absent_or_mistyped_expiry_falls_back_to_default() -> None:
+    server, calls = _dispatch_server()
+    for bad in (None, True, 12.5, "300"):
+        req = dict(VALID_REQ)
+        if bad is not None:
+            req["expires_in_seconds"] = bad
+        _dispatch(server, _request_event(server, PrivateKey(), req))
+    assert calls["issued"] == [(500, None, 120, False, None)] * 4
+
+
+# --- fixed-price offers --------------------------------------------------------
+
+def _fixed_dispatch_server() -> Tuple[Any, Dict[str, List[Any]]]:
+    """Like ``_dispatch_server`` but with a fixed-price offer (25000 sat)."""
+    from electrum.logging import Logger
+
+    from clink.noffer import OfferPriceType
+
+    server = ClinkServer.__new__(ClinkServer)
+    Logger.__init__(server)
+    server_sk = PrivateKey()
+    server.private_key = server_sk
+    server.pubkey_hex = server_sk.public_key.hex()
+    server._seen_events = OrderedDict()
+    server.recent_activity = deque(maxlen=50)
+    server._selftest_payers = {}
+    server.config = SimpleNamespace(CLINK_INVOICE_EXPIRY=120)
+    offer = Offer(offer_id="o1", label="L",
+                  price_type=OfferPriceType.FIXED, price=25000)
+    server.offers = SimpleNamespace(get=lambda oid: offer if oid == "o1" else None)
+    server.reserver = SimpleNamespace(available_sat=lambda: 100_000)
+    server.receipts = SimpleNamespace(pending_count_for=lambda pub: 0)
+
+    calls: Dict[str, List[Any]] = {"responses": [], "issued": []}
+
+    async def send_response(event: Any, payload: Dict[str, Any]) -> None:
+        calls["responses"].append(payload)
+
+    async def issue_invoice(event: Any, offer: Any, amount_sat: int,
+                            description: Optional[str] = None, *,
+                            expiry_sec: Optional[int] = None,
+                            selftest: bool = False,
+                            zap_raw: Optional[str] = None) -> None:
+        calls["issued"].append((amount_sat, description, expiry_sec, selftest, zap_raw))
+
+    server.send_response = send_response  # type: ignore[method-assign]
+    server._issue_invoice = issue_invoice  # type: ignore[method-assign]
+    return server, calls
+
+
+def test_fixed_offer_issues_invoice_at_price_without_amount() -> None:
+    server, calls = _fixed_dispatch_server()
+    # The spec makes amount_sats optional for a fixed offer.
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1"}))
+    assert calls["issued"] == [(25000, None, 120, False, None)]
+    assert calls["responses"] == []
+
+
+def test_fixed_offer_issues_invoice_at_matching_amount() -> None:
+    server, calls = _fixed_dispatch_server()
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1", "amount_sats": 25000}))
+    assert calls["issued"] == [(25000, None, 120, False, None)]
+
+
+def test_fixed_offer_rejects_differing_amount_at_dispatch() -> None:
+    server, calls = _fixed_dispatch_server()
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1", "amount_sats": 1}))
+    assert calls["issued"] == []
+    assert calls["responses"] == [{
+        "code": protocol.ERR_INVALID_AMOUNT, "error": "Invalid Amount",
+        "range": {"min": 25000, "max": 25000}}]
+
+
+# --- offer expiry and replacement (code 3 with latest) ------------------------
+
+def _replacement_dispatch_server() -> Tuple[Any, Dict[str, List[Any]]]:
+    """``_dispatch_server`` + a replaced offer (o1 -> o2) and a live o2.
+
+    ``_noffer_for`` runs for real (it is a real method on the shell), so the
+    code-3 ``latest`` field is a genuinely encoded noffer for o2.
+    """
+    from electrum.logging import Logger
+
+    server = ClinkServer.__new__(ClinkServer)
+    Logger.__init__(server)
+    server_sk = PrivateKey()
+    server.private_key = server_sk
+    server.pubkey_hex = server_sk.public_key.hex()
+    server._seen_events = OrderedDict()
+    server.recent_activity = deque(maxlen=50)
+    server._selftest_payers = {}
+    server.config = SimpleNamespace(CLINK_INVOICE_EXPIRY=120)
+    offers = {
+        "o1": Offer(offer_id="o1", label="old", active=False, replaced_by="o2"),
+        "o2": Offer(offer_id="o2", label="new"),
+    }
+    server.offers = SimpleNamespace(get=lambda oid: offers.get(oid))
+    server.offer_relay = lambda offer: "wss://relay.example"  # type: ignore[method-assign]
+    server.reserver = SimpleNamespace(available_sat=lambda: 100_000)
+    server.receipts = SimpleNamespace(pending_count_for=lambda pub: 0)
+
+    calls: Dict[str, List[Any]] = {"responses": [], "issued": []}
+
+    async def send_response(event: Any, payload: Dict[str, Any]) -> None:
+        calls["responses"].append(payload)
+
+    async def issue_invoice(event: Any, offer: Any, amount_sat: int,
+                            description: Optional[str] = None, *,
+                            expiry_sec: Optional[int] = None,
+                            selftest: bool = False,
+                            zap_raw: Optional[str] = None) -> None:
+        calls["issued"].append((amount_sat, description, expiry_sec, selftest, zap_raw))
+
+    server.send_response = send_response  # type: ignore[method-assign]
+    server._issue_invoice = issue_invoice  # type: ignore[method-assign]
+    return server, calls
+
+
+def test_moved_offer_answers_code_3_with_latest_noffer() -> None:
+    server, calls = _replacement_dispatch_server()
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1", "amount_sats": 500}))
+    assert calls["issued"] == []
+    assert len(calls["responses"]) == 1
+    payload = calls["responses"][0]
+    assert payload["code"] == protocol.ERR_EXPIRED_OFFER
+    # latest is a real, decodable noffer pointing at the replacement offer.
+    assert payload["latest"].startswith("noffer1q")
+    from clink.noffer import noffer_decode
+    assert noffer_decode(payload["latest"]).offer == "o2"
+
+
+def test_expired_offer_answers_code_3_without_latest() -> None:
+    from electrum.logging import Logger
+
+    server = ClinkServer.__new__(ClinkServer)
+    Logger.__init__(server)
+    server_sk = PrivateKey()
+    server.private_key = server_sk
+    server.pubkey_hex = server_sk.public_key.hex()
+    server._seen_events = OrderedDict()
+    server.recent_activity = deque(maxlen=50)
+    server._selftest_payers = {}
+    server.config = SimpleNamespace(CLINK_INVOICE_EXPIRY=120)
+    server.offers = SimpleNamespace(
+        get=lambda oid: Offer(offer_id="o1", expires_at=int(time.time()) - 1)
+        if oid == "o1" else None)
+    server.reserver = SimpleNamespace(available_sat=lambda: 100_000)
+    server.receipts = SimpleNamespace(pending_count_for=lambda pub: 0)
+
+    calls: Dict[str, List[Any]] = {"responses": [], "issued": []}
+
+    async def send_response(event: Any, payload: Dict[str, Any]) -> None:
+        calls["responses"].append(payload)
+
+    async def issue_invoice(event: Any, offer: Any, amount_sat: int,
+                            description: Optional[str] = None, *,
+                            expiry_sec: Optional[int] = None,
+                            selftest: bool = False,
+                            zap_raw: Optional[str] = None) -> None:
+        calls["issued"].append((amount_sat, description, expiry_sec, selftest, zap_raw))
+
+    server.send_response = send_response  # type: ignore[method-assign]
+    server._issue_invoice = issue_invoice  # type: ignore[method-assign]
+
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1", "amount_sats": 500}))
+    assert calls["issued"] == []
+    assert calls["responses"] == [{"code": protocol.ERR_EXPIRED_OFFER, "error": "Offer has expired."}]
+
+
+def test_inactive_offer_with_dead_replacement_stays_invalid() -> None:
+    server, calls = _replacement_dispatch_server()
+    # Drop o2: o1's replacement no longer exists, so latest must not be sent.
+    server.offers = SimpleNamespace(
+        get=lambda oid: Offer(offer_id="o1", active=False, replaced_by="o2")
+        if oid == "o1" else None)
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1", "amount_sats": 500}))
+    assert calls["issued"] == []
+    assert calls["responses"] == [{"code": protocol.ERR_INVALID_OFFER,
+                                   "error": "Unknown or inactive offer"}]
+
+
+def test_expired_offer_with_live_replacement_is_still_a_move() -> None:
+    server, calls = _replacement_dispatch_server()
+    # Time-based expiry rather than disablement: still points at the replacement.
+    server.offers = SimpleNamespace(
+        get=lambda oid: Offer(offer_id="o1", active=True,
+                              expires_at=int(time.time()) - 1, replaced_by="o2")
+        if oid == "o1" else Offer(offer_id="o2"))
+    _dispatch(server, _request_event(server, PrivateKey(), {"offer": "o1", "amount_sats": 500}))
+    assert calls["issued"] == []
+    assert len(calls["responses"]) == 1
+    assert calls["responses"][0]["code"] == protocol.ERR_EXPIRED_OFFER
+    assert calls["responses"][0]["latest"].startswith("noffer1q")
 
 
 # --- freshness clamps ---------------------------------------------------------
@@ -154,7 +376,7 @@ def test_duplicate_event_processed_once() -> None:
     event = _request_event(server, PrivateKey(), VALID_REQ)
     _dispatch(server, event)
     _dispatch(server, event)  # e.g. redelivered by a second relay
-    assert calls["issued"] == [(500, None, False)]
+    assert calls["issued"] == [(500, None, 120, False, None)]
     assert calls["responses"] == []  # the replay is dropped silently
 
 
@@ -172,7 +394,7 @@ def test_junk_events_do_not_pollute_seen_cache() -> None:
         _dispatch(server, junk)
     assert len(server._seen_events) == 1  # only the decryptable request was recorded
     _dispatch(server, valid)              # ...and its replay is still blocked
-    assert calls["issued"] == [(500, None, False)]
+    assert calls["issued"] == [(500, None, 120, False, None)]
 
 
 # --- request schema validation ------------------------------------------------
@@ -218,7 +440,7 @@ def test_payer_below_cap_is_served() -> None:
     server.receipts = SimpleNamespace(
         pending_count_for=lambda pub: MAX_PENDING_PER_PAYER - 1)
     _dispatch(server, _request_event(server, PrivateKey(), VALID_REQ))
-    assert calls["issued"] == [(500, None, False)]
+    assert calls["issued"] == [(500, None, 120, False, None)]
 
 
 def test_selftest_payer_bypasses_cap() -> None:
@@ -230,7 +452,7 @@ def test_selftest_payer_bypasses_cap() -> None:
     payer_sk = PrivateKey()
     server._selftest_payers[payer_sk.public_key.hex()] = time.time() + 60
     _dispatch(server, _request_event(server, payer_sk, VALID_REQ))
-    assert calls["issued"] == [(500, None, True)]
+    assert calls["issued"] == [(500, None, 120, True, None)]
 
 
 # --- error hygiene ------------------------------------------------------------
@@ -238,6 +460,7 @@ def test_selftest_payer_bypasses_cap() -> None:
 def test_invoice_failure_reply_is_generic() -> None:
     """A wallet-side exception must not leak its text to the payer."""
     from electrum.logging import Logger
+
     from clink.liquidity import LiquidityReserver
 
     server = ClinkServer.__new__(ClinkServer)
@@ -314,3 +537,117 @@ def test_gc_tolerates_missing_request() -> None:
     server, wallet = _gc_server(None)
     server._delete_stale_request("aa" * 32)  # must not raise
     assert wallet.deleted == []
+
+
+# --- NIP-57 zaps (kind 9734 riding on the kind-21001 request) -----------------
+
+def _signed_zap9734(recipient: str, *, amount_msat: int = 5000,
+                    relays: Tuple[str, ...] = ("wss://relay.example",),
+                    sender_sk: Optional[PrivateKey] = None,
+                    tags_extra: Optional[List[List[str]]] = None,
+                    content: str = "zap!") -> Tuple[PrivateKey, str]:
+    """A genuinely signed kind-9734 zap request (and the signing key)."""
+    from electrum_aionostr.event import Event
+
+    from clink import zap as zap_mod
+
+    sender_sk = sender_sk or PrivateKey()
+    tags = [["relays", *relays], ["p", recipient], *(tags_extra or [])]
+    if amount_msat is not None:
+        tags.append(["amount", str(amount_msat)])
+    ev = Event(
+        pubkey=sender_sk.public_key.hex(), kind=zap_mod.ZAP_REQUEST_KIND,
+        tags=tags, content=content,
+    ).sign(sender_sk.hex())
+    return sender_sk, json.dumps({
+        "id": ev.id, "pubkey": ev.pubkey, "created_at": ev.created_at,
+        "kind": ev.kind, "tags": ev.tags, "content": ev.content, "sig": ev.sig})
+
+
+def _zap_request_event(server: Any, payer_sk: PrivateKey, zap_raw: str, *,
+                       amount_sats: Optional[int] = None,
+                       offer: str = "o1") -> Event:
+    req: Dict[str, Any] = {"offer": offer, "zap": zap_raw}
+    if amount_sats is not None:
+        req["amount_sats"] = amount_sats
+    return _request_event(server, payer_sk, req)
+
+
+def test_zap_request_issues_invoice_at_zap_amount() -> None:
+    server, calls = _dispatch_server()
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=21000)  # 21 sat
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw))
+    assert calls["issued"] == [(21, None, 120, False, zap_raw)]
+    assert calls["responses"] == []
+
+
+def test_zap_amount_and_request_amount_must_agree() -> None:
+    server, calls = _dispatch_server()
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=21000)
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw, amount_sats=99))
+    assert calls["issued"] == []
+    assert calls["responses"] == [{
+        "code": protocol.ERR_INVALID_AMOUNT, "error": "Invalid Amount",
+        "range": {"min": 21, "max": 99}}]
+
+
+def test_zap_without_amount_uses_request_amount() -> None:
+    server, calls = _dispatch_server()
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=None)
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw, amount_sats=7))
+    assert calls["issued"] == [(7, None, 120, False, zap_raw)]
+
+
+def test_zap_without_any_amount_is_invalid_amount() -> None:
+    server, calls = _dispatch_server()
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=None)
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw))
+    assert calls["issued"] == []
+    assert calls["responses"] and calls["responses"][0]["code"] == protocol.ERR_INVALID_AMOUNT
+
+
+def test_forged_zap_request_is_refused() -> None:
+    server, calls = _dispatch_server()
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=21000)
+    forged = json.loads(zap_raw)
+    forged["content"] = "tampered"
+    _dispatch(server, _zap_request_event(
+        server, PrivateKey(), json.dumps(forged)))
+    assert calls["issued"] == []
+    assert calls["responses"] == [{
+        "code": protocol.ERR_UNSUPPORTED_FEATURE, "error": "Invalid zap request"}]
+
+
+def test_zap_for_another_service_is_refused() -> None:
+    server, calls = _dispatch_server()
+    # The 9734 zaps someone else; the CLINK request still addressed us.
+    _, zap_raw = _signed_zap9734("bb" * 32, amount_msat=21000)
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw))
+    assert calls["issued"] == []
+    assert calls["responses"] and calls["responses"][0]["code"] == protocol.ERR_UNSUPPORTED_FEATURE
+
+
+def test_non_string_zap_field_is_refused() -> None:
+    server, calls = _dispatch_server()
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=21000)
+    req = {"offer": "o1", "zap": json.loads(zap_raw)}  # object, not stringified
+    _dispatch(server, _request_event(server, PrivateKey(), req))
+    assert calls["issued"] == []
+    assert calls["responses"] and calls["responses"][0]["code"] == protocol.ERR_UNSUPPORTED_FEATURE
+
+
+def test_fixed_offer_zap_must_match_price() -> None:
+    server, calls = _fixed_dispatch_server()  # price 25000
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=25000000)  # 25000 sat
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw))
+    assert calls["issued"] == [(25000, None, 120, False, zap_raw)]
+
+
+def test_fixed_offer_zap_rejects_wrong_amount() -> None:
+    server, calls = _fixed_dispatch_server()  # price 25000
+    _, zap_raw = _signed_zap9734(server.pubkey_hex, amount_msat=1000)  # 1 sat
+    _dispatch(server, _zap_request_event(server, PrivateKey(), zap_raw))
+    assert calls["issued"] == []
+    assert calls["responses"] == [{
+        "code": protocol.ERR_INVALID_AMOUNT, "error": "Invalid Amount",
+        "range": {"min": 25000, "max": 25000}}]
