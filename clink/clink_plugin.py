@@ -17,13 +17,7 @@ from collections import OrderedDict, deque
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 import electrum_aionostr as aionostr
-from electrum_aionostr.event import Event as nEvent
-from electrum_aionostr.key import PrivateKey
-
-from electrum.logging import Logger
-from electrum.plugin import BasePlugin, hook
 from electrum.invoices import PR_EXPIRED, PR_PAID, PR_UNPAID, Invoice, Request
-from electrum.lnutil import RECEIVED
 from electrum.lnurl import (
     LNURL6Data,
     LNURLError,
@@ -32,6 +26,9 @@ from electrum.lnurl import (
     lightning_address_to_url,
     request_lnurl,
 )
+from electrum.lnutil import RECEIVED
+from electrum.logging import Logger
+from electrum.plugin import BasePlugin, hook
 from electrum.util import (
     EventListener,
     OldTaskGroup,
@@ -43,13 +40,23 @@ from electrum.util import (
     log_exceptions,
     make_aiohttp_proxy_connector,
 )
+from electrum_aionostr.event import Event as nEvent
+from electrum_aionostr.key import PrivateKey
 
 from . import nip44, protocol
+from . import zap as zap_mod
 from .devfee import MIN_PAYOUT_SAT, DevFeeLedger
 from .liquidity import LiquidityReserver, receivable_capacity_sat
 from .liveness import LivenessResult, RelayLivenessMonitor
+from .metadata import default_offer, merge_clink_offer
 from .noffer import Noffer, OfferPriceType, noffer_encode
-from .offers import Offer, OfferStore, advertised_relay, advertised_relays, listen_relays
+from .offers import (
+    Offer,
+    OfferStore,
+    advertised_relay,
+    advertised_relays,
+    listen_relays,
+)
 from .receipts import RETRY_INTERVAL_SEC, ReceiptRegistry, ReceiptTarget
 from .relay_probe import (
     ProbeResult,
@@ -58,7 +65,7 @@ from .relay_probe import (
     probe_relay_payable,
     select_payable_relay,
 )
-from .selftest import CheckResult, CheckStatus, check_noffer
+from .selftest import SELFTEST_AMOUNT_SAT, CheckResult, check_noffer
 
 if TYPE_CHECKING:
     from electrum.simple_config import SimpleConfig
@@ -84,6 +91,47 @@ RELAY_CACHE_TTL_SEC = 24 * 60 * 60
 # Self-test payer identities expire after this long even if the checker never
 # unregistered them (crash safety) — comfortably above the check timeout.
 SELFTEST_PAYER_TTL_SEC = 120
+
+
+def _offer_price(price: Optional[int]) -> Optional[int]:
+    """Validate a fixed-offer price (sats); return it or raise.
+
+    ``None`` or ``0`` means "spontaneous offer" (the cmdline and Qt surfaces
+    both map an absent/zero input to ``None`` anyway). A fixed price must be a
+    positive integer within the bitcoin supply; anything else is rejected before
+    it can be stored, so a stored FIXED offer is always payable at a known amount.
+    """
+    if price is None or price == 0:
+        return None
+    if isinstance(price, bool) or not isinstance(price, int) or price < 1:
+        raise UserFacingException(
+            "Fixed offer price must be a positive integer amount in sats.")
+    if price > protocol.MAX_AMOUNT_SAT:
+        raise UserFacingException(
+            f"Fixed offer price exceeds the bitcoin supply cap "
+            f"({protocol.MAX_AMOUNT_SAT} sats).")
+    return price
+
+
+def _offer_price_type(price: Optional[int]) -> OfferPriceType:
+    # Validate through _offer_price so 0/None (spontaneous) and invalid input
+    # (raises) are classified identically everywhere.
+    return OfferPriceType.FIXED if _offer_price(price) is not None else OfferPriceType.SPONTANEOUS
+
+
+def _offer_expires_at(expires_in: Optional[int]) -> int:
+    """The absolute epoch expiry for an offer with a ``expires_in`` lifetime.
+
+    ``None``/``0`` means "never expires" (``0``). ``expires_in`` must be a
+    positive number of seconds; anything else is rejected before it can be
+    stored so a stored offer always has a sane ``expires_at``.
+    """
+    if expires_in is None or expires_in == 0:
+        return 0
+    if isinstance(expires_in, bool) or not isinstance(expires_in, int) or expires_in < 1:
+        raise UserFacingException(
+            "Offer expiry must be a positive number of seconds.")
+    return int(time.time()) + expires_in
 
 
 class ClinkServer(Logger, EventListener):
@@ -188,6 +236,12 @@ class ClinkServer(Logger, EventListener):
     def invoice_expiry_sec(self) -> int:
         return int(self.config.CLINK_INVOICE_EXPIRY)  # type: ignore[attr-defined]
 
+    @property
+    def advertise_metadata(self) -> bool:
+        # Opt-out: publish the default offer's noffer in kind-0 metadata so
+        # profiles/directories can surface a CLINK payment entry point.
+        return bool(self.config.CLINK_ADVERTISE_METADATA)  # type: ignore[attr-defined]
+
     def offer_relay(self, offer: Optional[Offer]) -> str:
         """The relay ``offer``'s noffer advertises (its pinned relay, or the
         plugin-wide default for a pre-pinning legacy offer)."""
@@ -207,12 +261,29 @@ class ClinkServer(Logger, EventListener):
 
     def make_noffer(self, offer_id: str) -> str:
         """Build the noffer string a payer scans for ``offer_id``."""
+        offer = self.offers.get(offer_id)
         return noffer_encode(Noffer(
             pubkey=self.pubkey_hex,
-            relay=self.offer_relay(self.offers.get(offer_id)),
+            relay=self.offer_relay(offer),
             offer=offer_id,
-            price_type=OfferPriceType.SPONTANEOUS,
+            # Advertise the offer's own pricing so a payer sees the fixed price
+            # (TLV 4) and knows the amount is not negotiable before even asking.
+            price_type=offer.price_type if offer else OfferPriceType.SPONTANEOUS,
+            price=offer.price if offer else None,
         ))
+
+    def _noffer_for(self, offer_id: str) -> Optional[str]:
+        """The noffer for ``offer_id`` if it is still payable, else ``None``.
+
+        Injected into the protocol as the ``latest`` resolver for code-3
+        responses: a replacement offer only ever surfaces to the payer while it
+        is actually usable (exists, active, not yet expired), so ``latest`` can
+        never forward a payer to another broken offer.
+        """
+        offer = self.offers.get(offer_id)
+        if offer is None or not offer.active or protocol.offer_expired(offer):
+            return None
+        return self.make_noffer(offer_id)
 
     async def _liveness_probe(self, relay: str) -> ProbeResult:
         """Probe callable injected into the liveness monitor (fresh proxy each run)."""
@@ -395,8 +466,11 @@ class ClinkServer(Logger, EventListener):
         async def check_one(offer) -> None:
             # Test exactly the noffer string the table / QR shows for this offer.
             noffer_str = self.make_noffer(offer.offer_id)
+            # A fixed offer is only payable at its price; test it at that amount.
+            amount = offer.price if offer.price_type == OfferPriceType.FIXED else None
             result = await check_noffer(
                 noffer_str,
+                amount_sat=amount if amount is not None else SELFTEST_AMOUNT_SAT,
                 ssl_context=self.ssl_context,
                 proxy_factory=factory,
                 validate_bolt11=self._validate_selftest_bolt11,
@@ -450,6 +524,7 @@ class ClinkServer(Logger, EventListener):
                     await tg.spawn(self.handle_requests())
                     await tg.spawn(self._devfee_startup_check())
                     await tg.spawn(self._redeliver_receipts())
+                    await tg.spawn(self.sync_metadata())
             except asyncio.CancelledError:
                 if self.do_stop:
                     return
@@ -548,7 +623,46 @@ class ClinkServer(Logger, EventListener):
         selftest = self.is_selftest_payer(event.pubkey)
         offer_id = protocol.request_offer_id(req)
         offer = self.offers.get(offer_id) if offer_id is not None else None
-        resolution = protocol.resolve_request(req, offer, self.reserver.available_sat())
+
+        # A NIP-57 zap (``zap`` = stringified kind-9734) rides on a normal CLINK
+        # request: validate the 9734 (structure + signature + recipient + amount)
+        # and let its amount supply the invoice. A malformed/forged zap request
+        # is refused up front — it must never mint an invoice from a bogus number.
+        zap_raw = req.get("zap")
+        zap = None
+        if zap_raw is not None:
+            # The spec fixes ``zap`` as a *stringified* kind-9734 event; any
+            # other shape (a JSON object, a number) is a malformed zap request.
+            if isinstance(zap_raw, str):
+                zap = zap_mod.parse_zap_request(zap_raw)
+            err = None if zap is not None else "zap field is not a zap request"
+            if zap is not None:
+                err = zap_mod.zap_request_error(
+                    zap, expected_recipient=self.pubkey_hex)
+            if err:
+                self._record(offer_id or "", protocol.request_amount_sat(req),
+                             "error 4 (invalid zap)")
+                await self.send_response(event, protocol.error_payload(
+                    protocol.ERR_UNSUPPORTED_FEATURE, "Invalid zap request"))
+                return
+
+        # The zap amount (9734 ``amount`` millisats -> sats) is authoritative
+        # when present; it must agree with the request's amount_sats if both are
+        # given. Conflicting amounts are answered before any offer logic runs.
+        if zap is not None:
+            zap_amount, zap_err = zap_mod.zap_invoice_amount_sat(req, zap)
+            if zap_err is not None:
+                self._record(offer_id or "", protocol.request_amount_sat(req),
+                             f"error {zap_err.get('code')} (zap amount mismatch)")
+                await self.send_response(event, zap_err)
+                return
+            # Fold the zap amount into the request so the resolver treats it as
+            # the payer's named amount (fixed-price offers still gate it).
+            req = dict(req)
+            req["amount_sats"] = zap_amount
+
+        resolution = protocol.resolve_request(
+            req, offer, self.reserver.available_sat(), noffer_for=self._noffer_for)
         if isinstance(resolution, protocol.SendError):
             self._record(offer_id or "", protocol.request_amount_sat(req),
                          f"error {resolution.payload.get('code')}"
@@ -569,8 +683,13 @@ class ClinkServer(Logger, EventListener):
         # Fold in the payer's requested memo only when this offer permits it;
         # otherwise the invoice carries just the merchant's label.
         description = protocol.effective_description(offer, req)
+        # Honor the payer's requested invoice expiry (clamped by protocol) — the
+        # same value gates the bolt11, the liquidity reservation and the
+        # receipt registry, so a request can't widen one window behind another's.
+        expiry_sec = protocol.effective_expiry_sec(req, self.invoice_expiry_sec)
         await self._issue_invoice(
-            event, offer, resolution.amount_sat, description, selftest=selftest)
+            event, offer, resolution.amount_sat, description,
+            expiry_sec=expiry_sec, selftest=selftest, zap_raw=zap_raw)
 
     def _record(self, offer_id: str, amount: Optional[int], result: str) -> None:
         # offer_id can originate from a hostile payer; keep the activity feed
@@ -582,8 +701,13 @@ class ClinkServer(Logger, EventListener):
 
     async def _issue_invoice(self, event: nEvent, offer, amount_sat: int,
                              description: Optional[str] = None, *,
-                             selftest: bool = False) -> None:
-        expiry = self.invoice_expiry_sec
+                             expiry_sec: Optional[int] = None,
+                             selftest: bool = False,
+                             zap_raw: Optional[str] = None) -> None:
+        # The caller (dispatch) computes the effective expiry once from the
+        # request (payer's clamped expires_in_seconds, else our default) so the
+        # bolt11, reservation and receipt-registry windows all agree.
+        expiry = int(expiry_sec) if expiry_sec is not None else self.invoice_expiry_sec
         # Honor the payer's requested memo (NIP-69 description), combined with
         # the merchant's offer label, so the invoice carries who-it's-for context
         # (e.g. cashupayserver sends the store name). Capped/sanitized upstream.
@@ -619,8 +743,12 @@ class ClinkServer(Logger, EventListener):
             # Remember this hash so the dev fee accrues if (and only if) it is paid.
             self.devfee.mark_issued(request.rhash)
             # Remember who to send the payment receipt to once this invoice settles.
-            evicted = self.receipts.remember(request.rhash, event.pubkey, event.id,
-                                             expires_at=time.time() + expiry)
+            # A zap request is remembered verbatim (with its invoice) so the
+            # kind-9735 receipt can be built and published after settlement.
+            evicted = self.receipts.remember(
+                request.rhash, event.pubkey, event.id,
+                expires_at=time.time() + expiry,
+                zap=zap_raw, bolt11=bolt11)
             # An entry evicted by the registry cap must not orphan its wallet
             # request — drop it (if still unpaid) along with the entry.
             for stale_rhash in (evicted or []):
@@ -660,6 +788,80 @@ class ClinkServer(Logger, EventListener):
             **self._encrypt_event_args(request_event.pubkey, request_event.id, payload),
         ))
 
+    # --- kind-0 metadata advertising (clink_offer) ------------------------
+
+    async def _fetch_metadata_content(self) -> Optional[str]:
+        """The newest kind-0 content string published for our identity.
+
+        Several relays may each answer with a stored event; the latest
+        ``created_at`` wins. ``None`` when no relay has any metadata for us.
+        """
+        newest: Optional[nEvent] = None
+        async for ev in self.manager.get_events(
+                {"kinds": [0], "authors": [self.pubkey_hex], "limit": 1},
+                only_stored=True):
+            if newest is None or ev.created_at > newest.created_at:
+                newest = ev
+        return newest.content if newest is not None else None
+
+    async def _publish_metadata_content(self, content: str) -> None:
+        """Publish a signed kind-0 event to every connected relay."""
+        await aionostr._add_event(
+            self.manager, kind=0, content=content, tags=[],
+            private_key=self.private_key.hex())
+
+    async def sync_metadata(self) -> bool:
+        """Reconcile the kind-0 ``clink_offer`` field with the default offer.
+
+        Fetches our current metadata, merges the default offer's noffer in
+        (preserving every other profile field), and republishes only when the
+        content actually changed — so a connected relay is never spammed with
+        identical events. Returns True when a publish happened. Safe to call
+        any time: no-ops while the manager is down, metadata advertising is
+        disabled, or there is nothing to advertise yet.
+        """
+        if self.manager is None or not self.advertise_metadata:
+            return False
+        default = default_offer(self.offers.list())
+        noffer = self.make_noffer(default.offer_id) if default else None
+        try:
+            existing = await self._fetch_metadata_content()
+        except Exception:
+            self.logger.debug("could not fetch clink metadata", exc_info=True)
+            return False
+        target = merge_clink_offer(existing, noffer)
+        if target == existing:
+            return False
+        if not noffer and not (existing or "").strip():
+            return False
+        try:
+            await self._publish_metadata_content(target)
+        except Exception:
+            self.logger.exception("could not publish clink metadata")
+            return False
+        self.logger.info(
+            "advertised clink offer in kind-0 metadata"
+            + (f" ({default.offer_id})" if default else " (removed)"))
+        return True
+
+    def _schedule_metadata_sync(self) -> None:
+        """Fire ``sync_metadata`` onto the asyncio loop, if one is running.
+
+        Called from the plugin API (cmdline/Qt thread) after an offer mutation
+        changes which noffer is the default, so the advertisement follows the
+        offer without blocking the caller on a relay round trip.
+        """
+        try:
+            loop = get_asyncio_loop()
+        except Exception:
+            return
+        if loop is None or not loop.is_running():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self.sync_metadata(), loop)
+        except Exception:
+            self.logger.debug("could not schedule clink metadata sync", exc_info=True)
+
     def _delete_stale_request(self, rhash: str) -> None:
         """Garbage-collect the wallet request behind a dropped registry entry.
 
@@ -680,22 +882,47 @@ class ClinkServer(Logger, EventListener):
 
     # --- payment receipts ------------------------------------------------
 
+    def _preimage_for(self, rhash: str) -> Optional[str]:
+        """The settlement preimage of a paid invoice, for its payment receipt.
+
+        Invoices we issued carry their preimage in the wallet's preimage store
+        from creation, so ``get_preimage_hex`` answers immediately on ``PR_PAID``.
+        Returns ``None`` (an "internal settlement" receipt, per the CLINK spec)
+        if the wallet or its lnworker is ever not ready.
+        """
+        try:
+            lnworker = getattr(self.wallet, "lnworker", None)
+            if lnworker is None:
+                return None
+            return lnworker.get_preimage_hex(rhash)
+        except Exception:
+            self.logger.exception(f"could not read preimage for {rhash[:10]}…")
+            return None
+
     async def _deliver_receipt(self, target: ReceiptTarget) -> bool:
-        """Publish the ``{"res":"ok"}`` receipt for a settled invoice.
+        """Publish the payment receipt for a settled invoice.
 
         Best-effort and idempotent: stamps the attempt first (so a failure waits
         a full retry interval), awaits the relay publish, and only on success
         removes the owed entry. Never raises — a failure leaves the receipt owed
         for the periodic retry loop.
+
+        Two kinds of receipt exist. For a NIP-57 zap request the owed receipt is
+        a kind-9735 *zap receipt* published to the relays the payer named; for a
+        plain CLINK request it is the follow-up kind-21001 event carrying the
+        settlement preimage.
         """
         self.receipts.record_attempt(target.rhash)
         if self.manager is None:
             return False
+        if target.zap:
+            return await self._publish_zap_receipt(target)
         try:
             await asyncio.wait_for(aionostr._add_event(
                 self.manager,
                 **self._encrypt_event_args(
-                    target.payer_pubkey, target.request_event_id, protocol.receipt_payload()),
+                    target.payer_pubkey, target.request_event_id,
+                    protocol.receipt_payload(target.preimage)),
             ), timeout=30)
         except Exception as e:
             self.logger.warning(
@@ -707,6 +934,67 @@ class ClinkServer(Logger, EventListener):
                          f"for {target.rhash[:10]}…")
         self._record("receipt", None, "receipt sent ✓")
         return True
+
+    async def _publish_zap_receipt(self, target: ReceiptTarget) -> bool:
+        """Publish the kind-9735 zap receipt for a settled zap request.
+
+        Builds the receipt per NIP-57 (empty content, ``p``/``P``/``e``/``a``/
+        ``k``/``bolt11``/``description``/``preimage`` tags, ``created_at`` = the
+        payment time) and publishes it to every relay the payer named in the
+        9734's ``relays`` tag, counting a relay as delivered only when it
+        accepted the event. Returns True when at least one relay took it.
+        """
+        zap = zap_mod.zap_receipt_from_target(target)
+        relays = zap_mod.zap_relays(zap) if zap is not None else []
+        if zap is None or not relays:
+            # Nothing can be reconstructed (or nowhere to publish): the entry
+            # is owed for nothing — drop it so we never retry a dead receipt.
+            self.receipts.mark_sent(target.rhash)
+            return True
+        try:
+            from electrum_aionostr.event import Event
+        except Exception:
+            self.receipts.mark_sent(target.rhash)
+            return True
+        tags = zap_mod.zap_receipt_tags(
+            zap, target.zap or "", target.bolt11 or "", target.preimage)
+        try:
+            receipt = Event(
+                pubkey=self.pubkey_hex,
+                created_at=max(int(target.due_since), 1),
+                kind=zap_mod.ZAP_RECEIPT_KIND,
+                tags=tags,
+                content="",
+            ).sign(self.private_key.hex())
+        except Exception:
+            self.logger.exception(f"could not build zap receipt for {target.rhash[:10]}…")
+            self.receipts.mark_sent(target.rhash)
+            return True
+        factory = self._proxy_factory()
+        published = 0
+        for relay in relays:
+            try:
+                await asyncio.wait_for(
+                    self._publish_event_to(relay, receipt, factory), timeout=30)
+                published += 1
+            except Exception as e:
+                self.logger.warning(
+                    f"zap receipt to {relay} failed for {target.rhash[:10]}…: {e!r}")
+        if published:
+            self.receipts.mark_sent(target.rhash)
+            self.logger.info(f"zap receipt published to {published} relay(s) "
+                             f"for {target.rhash[:10]}…")
+            self._record("receipt", None, "zap receipt sent ✓")
+            return True
+        return False
+
+    async def _publish_event_to(self, relay: str, event: Any, factory: Any) -> None:
+        """Publish ``event`` to a single relay over a fresh one-shot manager."""
+        async with aionostr.Manager(
+                relays=[relay], private_key=self.private_key.hex(),
+                ssl_context=self.ssl_context,
+                proxy=factory() if factory else None) as man:
+            await man.add_event(event)
 
     async def _redeliver_receipts(self) -> None:
         """Retry any owed receipts now and hourly thereafter.
@@ -743,9 +1031,10 @@ class ClinkServer(Logger, EventListener):
             return
         self.reserver.release(request.rhash)
         # A receipt is now owed to the payer of this CLINK invoice; persist that
-        # (mark_due) and fire a best-effort delivery on the asyncio loop. The
-        # entry stays owed until the relay accepts it, so a drop here is retried.
-        target = self.receipts.mark_due(request.rhash)
+        # (mark_due, capturing the settlement preimage now) and fire a
+        # best-effort delivery on the asyncio loop. The entry stays owed until
+        # the relay accepts it, so a drop here is retried.
+        target = self.receipts.mark_due(request.rhash, preimage=self._preimage_for(request.rhash))
         if target is not None:
             asyncio.run_coroutine_threadsafe(
                 self._deliver_receipt(target), get_asyncio_loop())
@@ -835,7 +1124,7 @@ class ClinkServer(Logger, EventListener):
             except Exception as e:
                 self.logger.warning(f"dev-fee payout failed: {e!r}")
                 self.devfee.record_failure()
-                self._record("devfee", amount_sat, f"dev-fee payment failed")
+                self._record("devfee", amount_sat, "dev-fee payment failed")
                 return {"paid": False, "reason": f"payment failed: {e}"}
 
             if not success:
@@ -901,17 +1190,23 @@ class ClinkPlugin(BasePlugin):
     # --- API used by cmdline + Qt ----------------------------------------
 
     async def create_offer(self, label: str = "", allow_payer_memo: bool = True,
-                           relay: str = "") -> Dict[str, Any]:
+                           relay: str = "", price: Optional[int] = None,
+                           expires_in: Optional[int] = None) -> Dict[str, Any]:
         """Create an offer; ``relay`` (``wss://…``) pins a custom relay instead
-        of the automatic pick. Either way the relay is payability-probed first
-        and a failing probe *blocks* creation, and the chosen relay is pinned
-        onto the offer so the noffer handed to payers never changes across
-        restarts."""
+        of the automatic pick. ``price`` (positive sats) turns it into a fixed-
+        price offer whose noffer advertises TLV 3/4 and whose invoices are always
+        minted at exactly that amount; ``None`` keeps it spontaneous. Either way
+        the relay is payability-probed first and a failing probe *blocks*
+        creation, and the chosen relay is pinned onto the offer so the noffer
+        handed to payers never changes across restarts. ``expires_in`` (seconds)
+        sets an absolute ``expires_at`` on the offer: past it, payers get a
+        code-3 "expired" response instead of an invoice."""
         assert self.server is not None, "wallet not loaded yet"
         custom_relay = (relay or "").strip()
         if custom_relay:
             return await self._create_offer_custom_relay(
-                custom_relay, label=label, allow_payer_memo=allow_payer_memo)
+                custom_relay, label=label, allow_payer_memo=allow_payer_memo,
+                price=price, expires_in=expires_in)
         # Probe (cached 24h) before building the noffer so its single embedded
         # relay is one a payer can actually reach — see clink.relay_probe.
         selection = await self.server.pick_payable_relay()
@@ -927,19 +1222,26 @@ class ClinkPlugin(BasePlugin):
         needs_listener = selection.relay not in self.server.listen_relay_urls()
         offer = self.server.offers.create(
             label=label, allow_payer_memo=allow_payer_memo,
-            relay=selection.relay, relay_custom=False)
+            price_type=_offer_price_type(price), price=_offer_price(price),
+            relay=selection.relay, relay_custom=False,
+            expires_at=_offer_expires_at(expires_in))
         if needs_listener:
             self.server.restart_event_handler()
+        self.server._schedule_metadata_sync()
         return {
             "offer_id": offer.offer_id, "label": offer.label,
             "allow_payer_memo": offer.allow_payer_memo,
+            "price_type": int(offer.price_type), "price": offer.price,
             "noffer": self.server.make_noffer(offer.offer_id),
             "relay": offer.relay,
             "relay_payable": True,
+            "expires_at": offer.expires_at,
         }
 
     async def _create_offer_custom_relay(self, relay: str, *, label: str,
-                                         allow_payer_memo: bool) -> Dict[str, Any]:
+                                         allow_payer_memo: bool,
+                                         price: Optional[int] = None,
+                                         expires_in: Optional[int] = None) -> Dict[str, Any]:
         assert self.server is not None
         relay = normalize_relay_url(relay)  # ValueError on a malformed URL
         probe = await self.server.probe_custom_relay(relay)
@@ -952,16 +1254,21 @@ class ClinkPlugin(BasePlugin):
         # would never arrive; restart it only when the relay is actually new.
         needs_listener = relay not in self.server.listen_relay_urls()
         offer = self.server.offers.create(
-            label=label, allow_payer_memo=allow_payer_memo, relay=relay,
-            relay_custom=True)
+            label=label, allow_payer_memo=allow_payer_memo,
+            price_type=_offer_price_type(price), price=_offer_price(price),
+            relay=relay, relay_custom=True,
+            expires_at=_offer_expires_at(expires_in))
         if needs_listener:
             self.server.restart_event_handler()
+        self.server._schedule_metadata_sync()
         return {
             "offer_id": offer.offer_id, "label": offer.label,
             "allow_payer_memo": offer.allow_payer_memo,
+            "price_type": int(offer.price_type), "price": offer.price,
             "noffer": self.server.make_noffer(offer.offer_id),
             "relay": relay,
             "relay_payable": True,
+            "expires_at": offer.expires_at,
         }
 
     def list_offers(self) -> Dict[str, Any]:
@@ -971,12 +1278,15 @@ class ClinkPlugin(BasePlugin):
             return {}
         return {o.offer_id: {"label": o.label, "active": o.active,
                              "allow_payer_memo": o.allow_payer_memo,
+                             "price_type": int(o.price_type), "price": o.price,
                              "noffer": self.server.make_noffer(o.offer_id),
                              "relay": self.server.offer_relay(o),
                              "relay_custom": o.relay_custom,
                              # False only for a pre-pinning legacy offer whose
                              # relay is still re-derived from the config order.
-                             "relay_pinned": bool(o.relay.strip())}
+                             "relay_pinned": bool(o.relay.strip()),
+                             "expires_at": o.expires_at,
+                             "replaced_by": o.replaced_by}
                 for o in self.server.offers.list()}
 
     def candidate_relay_urls(self) -> List[str]:
@@ -984,6 +1294,34 @@ class ClinkPlugin(BasePlugin):
         if self.server is None:
             return []
         return self.server.candidate_relays()
+
+    async def advertise(self) -> Dict[str, Any]:
+        """Reconcile the kind-0 ``clink_offer`` advertisement right now.
+
+        Returns the outcome plus the advertised (or to-be-advertised) noffer so
+        callers can tell a fresh publish from an already-correct one.
+        """
+        assert self.server is not None, "wallet not loaded yet"
+        published = await self.server.sync_metadata()
+        status = self.metadata_status()
+        status["published"] = bool(published)
+        return status
+
+    def metadata_status(self) -> Dict[str, Any]:
+        """The current default-offer advertisement (no network I/O).
+
+        ``offer_id``/``noffer`` are what kind-0 metadata should advertise for
+        the live offer set; ``enabled`` reflects the advertising config.
+        """
+        if self.server is None:
+            return {"enabled": bool(self.config.CLINK_ADVERTISE_METADATA),
+                    "offer_id": None, "noffer": None}
+        default = default_offer(self.server.offers.list())
+        return {
+            "enabled": self.server.advertise_metadata,
+            "offer_id": default.offer_id if default else None,
+            "noffer": self.server.make_noffer(default.offer_id) if default else None,
+        }
 
     def set_offer_label(self, offer_id: str, label: str) -> bool:
         assert self.server is not None, "wallet not loaded yet"
@@ -1000,7 +1338,21 @@ class ClinkPlugin(BasePlugin):
         # Drop the listener connection to a custom relay no other offer needs.
         if removed and set(self.server.listen_relay_urls()) != before:
             self.server.restart_event_handler()
+        if removed:
+            self.server._schedule_metadata_sync()
         return removed
+
+    def replace_offer(self, offer_id: str, replacement_id: str) -> bool:
+        """Move ``offer_id`` onto ``replacement_id``: the outgoing offer stops
+        answering and requests for it get a code-3 response carrying a
+        ``latest`` noffer pointing at the replacement (see the spec), so a
+        payer holding the stale noffer updates and retries."""
+        assert self.server is not None, "wallet not loaded yet"
+        if not self.server.offers.replace_with(offer_id, replacement_id):
+            return False
+        ok = self.server.offers.set_active(offer_id, False)
+        self.server._schedule_metadata_sync()
+        return ok
 
     async def check_noffers(self, offer_id: Optional[str] = None) -> Dict[str, Any]:
         """Self-test the noffer of one offer (or all offers) end to end.

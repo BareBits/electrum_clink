@@ -50,6 +50,40 @@ def test_mark_due_unknown_hash_returns_none() -> None:
     assert reg.mark_due("never-issued") is None
 
 
+def test_mark_due_captures_preimage_on_target() -> None:
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("r", "p", "q", expires_at=clock() + 120)
+    preimage = "ab" * 32
+    target = reg.mark_due("r", preimage=preimage)
+    assert isinstance(target, ReceiptTarget)
+    assert target.preimage == preimage
+
+
+def test_mark_due_without_preimage_keeps_preimage_none() -> None:
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("r", "p", "q", expires_at=clock() + 120)
+    assert reg.mark_due("r").preimage is None
+
+
+def test_preimage_persists_across_reload() -> None:
+    # The preimage must survive a restart: a receipt retried hours later (after
+    # a reconnect/drop) must still carry the same proof of settlement.
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    preimage = "cd" * 32
+    _reg(storage, clock).remember("r", "p", "q", expires_at=clock() + 120)
+    _reg(storage, clock).mark_due("r", preimage=preimage)
+
+    reloaded = _reg(storage, clock)
+    targets = reloaded.due_targets()
+    assert [t.rhash for t in targets] == ["r"]
+    assert targets[0].preimage == preimage
+
+
 def test_mark_sent_removes_entry() -> None:
     storage: Dict[str, Any] = {}
     reg = _reg(storage, Clock())
@@ -213,3 +247,44 @@ def test_cap_evicts_unpaid_but_never_owed() -> None:
 
     assert reg.pending_count() <= MAX_PENDING
     assert reg.mark_due("owed") is not None  # the owed receipt is still there
+
+
+# --- NIP-57 zap context carry-through -----------------------------------------
+
+def test_remember_carries_zap_and_bolt11() -> None:
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("r", "p", "q", expires_at=clock() + 120,
+                 zap='{"kind": 9734}', bolt11="lnbcrt1zap")
+    target = reg.mark_due("r")
+    assert isinstance(target, ReceiptTarget)
+    assert target.zap == '{"kind": 9734}'
+    assert target.bolt11 == "lnbcrt1zap"
+
+
+def test_zap_context_survives_reload() -> None:
+    # The 9734 must persist across a restart: the kind-9735 receipt is built
+    # after payment, possibly hours later and after a reconnect.
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    _reg(storage, clock).remember("r", "p", "q", expires_at=clock() + 120,
+                                  zap='{"kind": 9734}', bolt11="lnbcrt1zap")
+    _reg(storage, clock).mark_due("r")
+
+    reloaded = _reg(storage, clock)
+    targets = reloaded.due_targets()
+    assert len(targets) == 1
+    assert targets[0].zap == '{"kind": 9734}'
+    assert targets[0].bolt11 == "lnbcrt1zap"
+
+
+def test_plain_receipt_has_no_zap_context() -> None:
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("r", "p", "q", expires_at=clock() + 120)
+    target = reg.mark_due("r")
+    assert isinstance(target, ReceiptTarget)
+    assert target.zap is None
+    assert target.bolt11 is None
