@@ -50,6 +50,40 @@ def test_mark_due_unknown_hash_returns_none() -> None:
     assert reg.mark_due("never-issued") is None
 
 
+def test_mark_due_captures_preimage_on_target() -> None:
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("r", "p", "q", expires_at=clock() + 120)
+    preimage = "ab" * 32
+    target = reg.mark_due("r", preimage=preimage)
+    assert isinstance(target, ReceiptTarget)
+    assert target.preimage == preimage
+
+
+def test_mark_due_without_preimage_keeps_preimage_none() -> None:
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("r", "p", "q", expires_at=clock() + 120)
+    assert reg.mark_due("r").preimage is None
+
+
+def test_preimage_persists_across_reload() -> None:
+    # The preimage must survive a restart: a receipt retried hours later (after
+    # a reconnect/drop) must still carry the same proof of settlement.
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    preimage = "cd" * 32
+    _reg(storage, clock).remember("r", "p", "q", expires_at=clock() + 120)
+    _reg(storage, clock).mark_due("r", preimage=preimage)
+
+    reloaded = _reg(storage, clock)
+    targets = reloaded.due_targets()
+    assert [t.rhash for t in targets] == ["r"]
+    assert targets[0].preimage == preimage
+
+
 def test_mark_sent_removes_entry() -> None:
     storage: Dict[str, Any] = {}
     reg = _reg(storage, Clock())

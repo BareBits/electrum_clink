@@ -7,3 +7,8 @@ build/
 .venv/
 venv/
 node_modules/
+.deps/
+# Local artifacts (downloaded release zip, working images) — not part of the repo.
+*.zip
+erwfds.png
+.DS_Store

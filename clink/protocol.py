@@ -2,11 +2,12 @@
 
 The wire payloads (NIP-44-decrypted JSON) and the decision of *what* to reply are
 kept here, free of any relay or Electrum I/O, so the core policy — offer lookup,
-spontaneous-amount handling and the inbound-liquidity gate — is unit-testable.
+fixed/spontaneous amount handling and the inbound-liquidity gate — is unit-testable.
 
-Request  (payer -> us):  {"offer", "amount_sats"?, "zap"?, "payer_data"?, ...}
+Request  (payer -> us):  {"offer", "amount_sats"?, "zap"?, "payer_data"?, "expires_in_seconds"?, "description"?}
 Success  (us -> payer):  {"bolt11": "..."}
 Error    (us -> payer):  {"code": int, "error": str, "range"?: {"min","max"}}
+Receipt  (us -> payer):  {"res": "ok", "preimage"?}
 """
 
 from __future__ import annotations
@@ -42,14 +43,54 @@ def success_payload(bolt11: str) -> Dict[str, Any]:
     return {"bolt11": bolt11}
 
 
-def receipt_payload() -> Dict[str, Any]:
+def receipt_payload(preimage: Optional[str] = None) -> Dict[str, Any]:
     """The post-payment receipt body the payer's ``onReceipt`` callback expects.
 
     Sent as a *second* kind-21001 event (after the invoice) once the invoice we
-    issued for an offer is actually paid. Kept byte-compatible with the reference
-    ``@shocknet/clink-sdk`` ``NofferReceipt`` type, which is exactly ``{res: 'ok'}``.
+    issued for an offer is actually paid. Per the CLINK offers spec a standard
+    Lightning payment MUST include the ``preimage`` (64-char hex) proving the
+    payment settled; its absence means an internal settlement and the payload is
+    the bare ``{"res": "ok"}`` the reference ``@shocknet/clink-sdk``
+    ``NofferReceipt`` type is.
     """
-    return {"res": "ok"}
+    payload: Dict[str, Any] = {"res": "ok"}
+    if preimage:
+        payload["preimage"] = preimage
+    return payload
+
+
+# Bounds for the payer-requested invoice expiry (``expires_in_seconds``). The
+# floor keeps an invoice payable long enough to actually settle; the cap bounds
+# how long a hostile payer can pin inbound liquidity through a single request.
+MIN_INVOICE_EXPIRY_SEC = 60
+MAX_INVOICE_EXPIRY_SEC = 24 * 60 * 60  # 24h
+
+
+def request_expiry_sec(req: Dict[str, Any]) -> Optional[int]:
+    """Extract the payer's requested invoice expiry, validated and clamped.
+
+    ``expires_in_seconds`` (CLINK spec, optional) names how long the payer wants
+    the invoice valid. Accepts an integer only (never a bool, float, or string);
+    values outside the sanity window are clamped into it, so a hostile value can
+    never lock liquidity for longer than :data:`MAX_INVOICE_EXPIRY_SEC` nor mint
+    an unpayably short invoice. Returns ``None`` when absent or mistyped, so the
+    caller falls back to its own default.
+    """
+    raw = req.get("expires_in_seconds")
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return max(MIN_INVOICE_EXPIRY_SEC, min(MAX_INVOICE_EXPIRY_SEC, raw))
+
+
+def effective_expiry_sec(req: Dict[str, Any], default_expiry: int) -> int:
+    """The invoice expiry to apply to ``req``: its clamped request or the default.
+
+    Every consumer of the expiry — the bolt11 ``exp_delay``, the liquidity
+    reservation and the receipt registry's ``expires_at`` — must use the same
+    value, so the caller computes it once and threads it through.
+    """
+    requested = request_expiry_sec(req)
+    return int(default_expiry) if requested is None else requested
 
 
 # Cap for the human-readable invoice memo. The CLINK request ``description`` is
@@ -192,6 +233,22 @@ class SendError:
 Resolution = Union[IssueInvoice, SendError]
 
 
+def fixed_offer_price_sat(offer: Offer, min_sat: int = 1) -> Optional[int]:
+    """The payable sats amount of a FIXED offer, or ``None`` if misconfigured.
+
+    A fixed offer must advertise a positive integer price no larger than the
+    bitcoin supply; anything else (missing, float, bool, negative, zero) is a
+    broken offer that cannot be answered as-is. The caller answers such an
+    offer with an invalid-offer error.
+    """
+    price = getattr(offer, "price", None)
+    if isinstance(price, bool) or not isinstance(price, int):
+        return None
+    if not (min_sat <= price <= MAX_AMOUNT_SAT):
+        return None
+    return price
+
+
 def resolve_request(
     req: Dict[str, Any],
     offer: Optional[Offer],
@@ -207,10 +264,24 @@ def resolve_request(
     if offer is None or not offer.active:
         return SendError(error_payload(ERR_INVALID_OFFER, "Unknown or inactive offer"))
 
-    if offer.price_type != OfferPriceType.SPONTANEOUS:
-        # FIXED/VARIABLE are intentionally stubbed for v1.
+    if offer.price_type == OfferPriceType.FIXED:
+        # The merchant fixed the price; a payer may omit the amount (the spec
+        # makes it optional for fixed offers) but must not name a different one.
+        price = fixed_offer_price_sat(offer, min_sat)
+        if price is None:
+            return SendError(error_payload(ERR_INVALID_OFFER, "Unknown or inactive offer"))
+        requested = request_amount_sat(req)
+        if requested is not None and requested != price:
+            # Range collapses to the exact price: the offer is only payable at it.
+            return SendError(invalid_amount_payload(price, price))
+        if price > available_sat:
+            return SendError(invalid_amount_payload(price, price))
+        return IssueInvoice(price)
+
+    if offer.price_type == OfferPriceType.VARIABLE:
+        # VARIABLE needs a price oracle we don't have yet.
         return SendError(error_payload(
-            ERR_UNSUPPORTED_FEATURE, "Only spontaneous offers are supported"))
+            ERR_UNSUPPORTED_FEATURE, "Only fixed and spontaneous offers are supported"))
 
     amount = request_amount_sat(req)
     if amount is None or amount < min_sat:

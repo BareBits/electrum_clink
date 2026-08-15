@@ -18,7 +18,7 @@ whole sats.
 
 from __future__ import annotations
 
-from typing import Any, Callable, List, MutableMapping, Optional
+from typing import Any, Callable, List, MutableMapping
 
 # Don't bother paying out until at least this much has accrued.
 MIN_PAYOUT_SAT = 1_000

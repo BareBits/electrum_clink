@@ -17,13 +17,7 @@ from collections import OrderedDict, deque
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 import electrum_aionostr as aionostr
-from electrum_aionostr.event import Event as nEvent
-from electrum_aionostr.key import PrivateKey
-
-from electrum.logging import Logger
-from electrum.plugin import BasePlugin, hook
 from electrum.invoices import PR_EXPIRED, PR_PAID, PR_UNPAID, Invoice, Request
-from electrum.lnutil import RECEIVED
 from electrum.lnurl import (
     LNURL6Data,
     LNURLError,
@@ -32,6 +26,9 @@ from electrum.lnurl import (
     lightning_address_to_url,
     request_lnurl,
 )
+from electrum.lnutil import RECEIVED
+from electrum.logging import Logger
+from electrum.plugin import BasePlugin, hook
 from electrum.util import (
     EventListener,
     OldTaskGroup,
@@ -43,13 +40,21 @@ from electrum.util import (
     log_exceptions,
     make_aiohttp_proxy_connector,
 )
+from electrum_aionostr.event import Event as nEvent
+from electrum_aionostr.key import PrivateKey
 
 from . import nip44, protocol
 from .devfee import MIN_PAYOUT_SAT, DevFeeLedger
 from .liquidity import LiquidityReserver, receivable_capacity_sat
 from .liveness import LivenessResult, RelayLivenessMonitor
 from .noffer import Noffer, OfferPriceType, noffer_encode
-from .offers import Offer, OfferStore, advertised_relay, advertised_relays, listen_relays
+from .offers import (
+    Offer,
+    OfferStore,
+    advertised_relay,
+    advertised_relays,
+    listen_relays,
+)
 from .receipts import RETRY_INTERVAL_SEC, ReceiptRegistry, ReceiptTarget
 from .relay_probe import (
     ProbeResult,
@@ -58,7 +63,7 @@ from .relay_probe import (
     probe_relay_payable,
     select_payable_relay,
 )
-from .selftest import CheckResult, CheckStatus, check_noffer
+from .selftest import SELFTEST_AMOUNT_SAT, CheckResult, check_noffer
 
 if TYPE_CHECKING:
     from electrum.simple_config import SimpleConfig
@@ -84,6 +89,32 @@ RELAY_CACHE_TTL_SEC = 24 * 60 * 60
 # Self-test payer identities expire after this long even if the checker never
 # unregistered them (crash safety) — comfortably above the check timeout.
 SELFTEST_PAYER_TTL_SEC = 120
+
+
+def _offer_price(price: Optional[int]) -> Optional[int]:
+    """Validate a fixed-offer price (sats); return it or raise.
+
+    ``None`` or ``0`` means "spontaneous offer" (the cmdline and Qt surfaces
+    both map an absent/zero input to ``None`` anyway). A fixed price must be a
+    positive integer within the bitcoin supply; anything else is rejected before
+    it can be stored, so a stored FIXED offer is always payable at a known amount.
+    """
+    if price is None or price == 0:
+        return None
+    if isinstance(price, bool) or not isinstance(price, int) or price < 1:
+        raise UserFacingException(
+            "Fixed offer price must be a positive integer amount in sats.")
+    if price > protocol.MAX_AMOUNT_SAT:
+        raise UserFacingException(
+            f"Fixed offer price exceeds the bitcoin supply cap "
+            f"({protocol.MAX_AMOUNT_SAT} sats).")
+    return price
+
+
+def _offer_price_type(price: Optional[int]) -> OfferPriceType:
+    # Validate through _offer_price so 0/None (spontaneous) and invalid input
+    # (raises) are classified identically everywhere.
+    return OfferPriceType.FIXED if _offer_price(price) is not None else OfferPriceType.SPONTANEOUS
 
 
 class ClinkServer(Logger, EventListener):
@@ -207,11 +238,15 @@ class ClinkServer(Logger, EventListener):
 
     def make_noffer(self, offer_id: str) -> str:
         """Build the noffer string a payer scans for ``offer_id``."""
+        offer = self.offers.get(offer_id)
         return noffer_encode(Noffer(
             pubkey=self.pubkey_hex,
-            relay=self.offer_relay(self.offers.get(offer_id)),
+            relay=self.offer_relay(offer),
             offer=offer_id,
-            price_type=OfferPriceType.SPONTANEOUS,
+            # Advertise the offer's own pricing so a payer sees the fixed price
+            # (TLV 4) and knows the amount is not negotiable before even asking.
+            price_type=offer.price_type if offer else OfferPriceType.SPONTANEOUS,
+            price=offer.price if offer else None,
         ))
 
     async def _liveness_probe(self, relay: str) -> ProbeResult:
@@ -395,8 +430,11 @@ class ClinkServer(Logger, EventListener):
         async def check_one(offer) -> None:
             # Test exactly the noffer string the table / QR shows for this offer.
             noffer_str = self.make_noffer(offer.offer_id)
+            # A fixed offer is only payable at its price; test it at that amount.
+            amount = offer.price if offer.price_type == OfferPriceType.FIXED else None
             result = await check_noffer(
                 noffer_str,
+                amount_sat=amount if amount is not None else SELFTEST_AMOUNT_SAT,
                 ssl_context=self.ssl_context,
                 proxy_factory=factory,
                 validate_bolt11=self._validate_selftest_bolt11,
@@ -569,8 +607,13 @@ class ClinkServer(Logger, EventListener):
         # Fold in the payer's requested memo only when this offer permits it;
         # otherwise the invoice carries just the merchant's label.
         description = protocol.effective_description(offer, req)
+        # Honor the payer's requested invoice expiry (clamped by protocol) — the
+        # same value gates the bolt11, the liquidity reservation and the
+        # receipt registry, so a request can't widen one window behind another's.
+        expiry_sec = protocol.effective_expiry_sec(req, self.invoice_expiry_sec)
         await self._issue_invoice(
-            event, offer, resolution.amount_sat, description, selftest=selftest)
+            event, offer, resolution.amount_sat, description,
+            expiry_sec=expiry_sec, selftest=selftest)
 
     def _record(self, offer_id: str, amount: Optional[int], result: str) -> None:
         # offer_id can originate from a hostile payer; keep the activity feed
@@ -582,8 +625,12 @@ class ClinkServer(Logger, EventListener):
 
     async def _issue_invoice(self, event: nEvent, offer, amount_sat: int,
                              description: Optional[str] = None, *,
+                             expiry_sec: Optional[int] = None,
                              selftest: bool = False) -> None:
-        expiry = self.invoice_expiry_sec
+        # The caller (dispatch) computes the effective expiry once from the
+        # request (payer's clamped expires_in_seconds, else our default) so the
+        # bolt11, reservation and receipt-registry windows all agree.
+        expiry = int(expiry_sec) if expiry_sec is not None else self.invoice_expiry_sec
         # Honor the payer's requested memo (NIP-69 description), combined with
         # the merchant's offer label, so the invoice carries who-it's-for context
         # (e.g. cashupayserver sends the store name). Capped/sanitized upstream.
@@ -680,8 +727,25 @@ class ClinkServer(Logger, EventListener):
 
     # --- payment receipts ------------------------------------------------
 
+    def _preimage_for(self, rhash: str) -> Optional[str]:
+        """The settlement preimage of a paid invoice, for its payment receipt.
+
+        Invoices we issued carry their preimage in the wallet's preimage store
+        from creation, so ``get_preimage_hex`` answers immediately on ``PR_PAID``.
+        Returns ``None`` (an "internal settlement" receipt, per the CLINK spec)
+        if the wallet or its lnworker is ever not ready.
+        """
+        try:
+            lnworker = getattr(self.wallet, "lnworker", None)
+            if lnworker is None:
+                return None
+            return lnworker.get_preimage_hex(rhash)
+        except Exception:
+            self.logger.exception(f"could not read preimage for {rhash[:10]}…")
+            return None
+
     async def _deliver_receipt(self, target: ReceiptTarget) -> bool:
-        """Publish the ``{"res":"ok"}`` receipt for a settled invoice.
+        """Publish the payment receipt for a settled invoice.
 
         Best-effort and idempotent: stamps the attempt first (so a failure waits
         a full retry interval), awaits the relay publish, and only on success
@@ -695,7 +759,8 @@ class ClinkServer(Logger, EventListener):
             await asyncio.wait_for(aionostr._add_event(
                 self.manager,
                 **self._encrypt_event_args(
-                    target.payer_pubkey, target.request_event_id, protocol.receipt_payload()),
+                    target.payer_pubkey, target.request_event_id,
+                    protocol.receipt_payload(target.preimage)),
             ), timeout=30)
         except Exception as e:
             self.logger.warning(
@@ -743,9 +808,10 @@ class ClinkServer(Logger, EventListener):
             return
         self.reserver.release(request.rhash)
         # A receipt is now owed to the payer of this CLINK invoice; persist that
-        # (mark_due) and fire a best-effort delivery on the asyncio loop. The
-        # entry stays owed until the relay accepts it, so a drop here is retried.
-        target = self.receipts.mark_due(request.rhash)
+        # (mark_due, capturing the settlement preimage now) and fire a
+        # best-effort delivery on the asyncio loop. The entry stays owed until
+        # the relay accepts it, so a drop here is retried.
+        target = self.receipts.mark_due(request.rhash, preimage=self._preimage_for(request.rhash))
         if target is not None:
             asyncio.run_coroutine_threadsafe(
                 self._deliver_receipt(target), get_asyncio_loop())
@@ -835,7 +901,7 @@ class ClinkServer(Logger, EventListener):
             except Exception as e:
                 self.logger.warning(f"dev-fee payout failed: {e!r}")
                 self.devfee.record_failure()
-                self._record("devfee", amount_sat, f"dev-fee payment failed")
+                self._record("devfee", amount_sat, "dev-fee payment failed")
                 return {"paid": False, "reason": f"payment failed: {e}"}
 
             if not success:
@@ -901,17 +967,20 @@ class ClinkPlugin(BasePlugin):
     # --- API used by cmdline + Qt ----------------------------------------
 
     async def create_offer(self, label: str = "", allow_payer_memo: bool = True,
-                           relay: str = "") -> Dict[str, Any]:
+                           relay: str = "", price: Optional[int] = None) -> Dict[str, Any]:
         """Create an offer; ``relay`` (``wss://…``) pins a custom relay instead
-        of the automatic pick. Either way the relay is payability-probed first
-        and a failing probe *blocks* creation, and the chosen relay is pinned
-        onto the offer so the noffer handed to payers never changes across
-        restarts."""
+        of the automatic pick. ``price`` (positive sats) turns it into a fixed-
+        price offer whose noffer advertises TLV 3/4 and whose invoices are always
+        minted at exactly that amount; ``None`` keeps it spontaneous. Either way
+        the relay is payability-probed first and a failing probe *blocks*
+        creation, and the chosen relay is pinned onto the offer so the noffer
+        handed to payers never changes across restarts."""
         assert self.server is not None, "wallet not loaded yet"
         custom_relay = (relay or "").strip()
         if custom_relay:
             return await self._create_offer_custom_relay(
-                custom_relay, label=label, allow_payer_memo=allow_payer_memo)
+                custom_relay, label=label, allow_payer_memo=allow_payer_memo,
+                price=price)
         # Probe (cached 24h) before building the noffer so its single embedded
         # relay is one a payer can actually reach — see clink.relay_probe.
         selection = await self.server.pick_payable_relay()
@@ -927,19 +996,22 @@ class ClinkPlugin(BasePlugin):
         needs_listener = selection.relay not in self.server.listen_relay_urls()
         offer = self.server.offers.create(
             label=label, allow_payer_memo=allow_payer_memo,
+            price_type=_offer_price_type(price), price=_offer_price(price),
             relay=selection.relay, relay_custom=False)
         if needs_listener:
             self.server.restart_event_handler()
         return {
             "offer_id": offer.offer_id, "label": offer.label,
             "allow_payer_memo": offer.allow_payer_memo,
+            "price_type": int(offer.price_type), "price": offer.price,
             "noffer": self.server.make_noffer(offer.offer_id),
             "relay": offer.relay,
             "relay_payable": True,
         }
 
     async def _create_offer_custom_relay(self, relay: str, *, label: str,
-                                         allow_payer_memo: bool) -> Dict[str, Any]:
+                                         allow_payer_memo: bool,
+                                         price: Optional[int] = None) -> Dict[str, Any]:
         assert self.server is not None
         relay = normalize_relay_url(relay)  # ValueError on a malformed URL
         probe = await self.server.probe_custom_relay(relay)
@@ -952,13 +1024,15 @@ class ClinkPlugin(BasePlugin):
         # would never arrive; restart it only when the relay is actually new.
         needs_listener = relay not in self.server.listen_relay_urls()
         offer = self.server.offers.create(
-            label=label, allow_payer_memo=allow_payer_memo, relay=relay,
-            relay_custom=True)
+            label=label, allow_payer_memo=allow_payer_memo,
+            price_type=_offer_price_type(price), price=_offer_price(price),
+            relay=relay, relay_custom=True)
         if needs_listener:
             self.server.restart_event_handler()
         return {
             "offer_id": offer.offer_id, "label": offer.label,
             "allow_payer_memo": offer.allow_payer_memo,
+            "price_type": int(offer.price_type), "price": offer.price,
             "noffer": self.server.make_noffer(offer.offer_id),
             "relay": relay,
             "relay_payable": True,
@@ -971,6 +1045,7 @@ class ClinkPlugin(BasePlugin):
             return {}
         return {o.offer_id: {"label": o.label, "active": o.active,
                              "allow_payer_memo": o.allow_payer_memo,
+                             "price_type": int(o.price_type), "price": o.price,
                              "noffer": self.server.make_noffer(o.offer_id),
                              "relay": self.server.offer_relay(o),
                              "relay_custom": o.relay_custom,

@@ -28,3 +28,10 @@ markers = [
 # Unit tests run by default; opt into the slow/network suites explicitly with
 # `-m e2e` or `-m live_relay`.
 addopts = "-m 'not e2e and not live_relay'"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B"]
