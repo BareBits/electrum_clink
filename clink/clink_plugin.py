@@ -685,8 +685,25 @@ class ClinkServer(Logger, EventListener):
 
     # --- payment receipts ------------------------------------------------
 
+    def _preimage_for(self, rhash: str) -> Optional[str]:
+        """The settlement preimage of a paid invoice, for its payment receipt.
+
+        Invoices we issued carry their preimage in the wallet's preimage store
+        from creation, so ``get_preimage_hex`` answers immediately on ``PR_PAID``.
+        Returns ``None`` (an "internal settlement" receipt, per the CLINK spec)
+        if the wallet or its lnworker is ever not ready.
+        """
+        try:
+            lnworker = getattr(self.wallet, "lnworker", None)
+            if lnworker is None:
+                return None
+            return lnworker.get_preimage_hex(rhash)
+        except Exception:
+            self.logger.exception(f"could not read preimage for {rhash[:10]}…")
+            return None
+
     async def _deliver_receipt(self, target: ReceiptTarget) -> bool:
-        """Publish the ``{"res":"ok"}`` receipt for a settled invoice.
+        """Publish the payment receipt for a settled invoice.
 
         Best-effort and idempotent: stamps the attempt first (so a failure waits
         a full retry interval), awaits the relay publish, and only on success
@@ -700,7 +717,8 @@ class ClinkServer(Logger, EventListener):
             await asyncio.wait_for(aionostr._add_event(
                 self.manager,
                 **self._encrypt_event_args(
-                    target.payer_pubkey, target.request_event_id, protocol.receipt_payload()),
+                    target.payer_pubkey, target.request_event_id,
+                    protocol.receipt_payload(target.preimage)),
             ), timeout=30)
         except Exception as e:
             self.logger.warning(
@@ -748,9 +766,10 @@ class ClinkServer(Logger, EventListener):
             return
         self.reserver.release(request.rhash)
         # A receipt is now owed to the payer of this CLINK invoice; persist that
-        # (mark_due) and fire a best-effort delivery on the asyncio loop. The
-        # entry stays owed until the relay accepts it, so a drop here is retried.
-        target = self.receipts.mark_due(request.rhash)
+        # (mark_due, capturing the settlement preimage now) and fire a
+        # best-effort delivery on the asyncio loop. The entry stays owed until
+        # the relay accepts it, so a drop here is retried.
+        target = self.receipts.mark_due(request.rhash, preimage=self._preimage_for(request.rhash))
         if target is not None:
             asyncio.run_coroutine_threadsafe(
                 self._deliver_receipt(target), get_asyncio_loop())

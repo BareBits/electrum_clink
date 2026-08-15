@@ -94,7 +94,8 @@ async def request_invoice_and_receipt(
     Mirrors the reference ``@shocknet/clink-sdk``: keep the same ``#p``+``#e``
     subscription open after the invoice arrives, pay it (via the injected ``pay``
     callback, run off the event loop), then wait for the *second* kind-21001
-    event — the ``{"res": "ok"}`` receipt the SDK surfaces to ``onReceipt``.
+    event — the ``{"res": "ok", "preimage": ...}`` receipt the SDK surfaces to
+    ``onReceipt`` (a standard Lightning payment carries the settlement preimage).
 
     Returns ``{"invoice": <payload>, "receipt": <payload or None>}``. ``receipt``
     is ``None`` if the first reply was an error rather than an invoice.

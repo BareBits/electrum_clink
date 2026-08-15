@@ -42,14 +42,20 @@ def success_payload(bolt11: str) -> Dict[str, Any]:
     return {"bolt11": bolt11}
 
 
-def receipt_payload() -> Dict[str, Any]:
+def receipt_payload(preimage: Optional[str] = None) -> Dict[str, Any]:
     """The post-payment receipt body the payer's ``onReceipt`` callback expects.
 
     Sent as a *second* kind-21001 event (after the invoice) once the invoice we
-    issued for an offer is actually paid. Kept byte-compatible with the reference
-    ``@shocknet/clink-sdk`` ``NofferReceipt`` type, which is exactly ``{res: 'ok'}``.
+    issued for an offer is actually paid. Per the CLINK offers spec a standard
+    Lightning payment MUST include the ``preimage`` (64-char hex) proving the
+    payment settled; its absence means an internal settlement and the payload is
+    the bare ``{"res": "ok"}`` the reference ``@shocknet/clink-sdk``
+    ``NofferReceipt`` type is.
     """
-    return {"res": "ok"}
+    payload: Dict[str, Any] = {"res": "ok"}
+    if preimage:
+        payload["preimage"] = preimage
+    return payload
 
 
 # Cap for the human-readable invoice memo. The CLINK request ``description`` is

@@ -3,10 +3,12 @@
 The CLINK offers flow has two halves. First we answer a kind-21001 *request* with
 an invoice (handled elsewhere). Second, once that invoice is actually paid, we
 owe the payer a *receipt*: a follow-up kind-21001 event whose decrypted body is
-``{"res": "ok"}`` (the reference ``@shocknet/clink-sdk`` delivers it to the
-payer's ``onReceipt`` callback). This module remembers, for every invoice we
-issue, who to send that receipt to and which request it answers — so a receipt
-can still be delivered after a relay drop, reconnect, or full Electrum restart.
+``{"res": "ok"}`` — plus the settlement ``preimage`` for a standard Lightning
+payment (the reference ``@shocknet/clink-sdk`` delivers it to the payer's
+``onReceipt`` callback). This module remembers, for every invoice we issue, who
+to send that receipt to, which request it answers, and the preimage — so a
+receipt can still be delivered after a relay drop, reconnect, or full Electrum
+restart.
 
 Design mirrors :mod:`clink.devfee` / :mod:`clink.offers`: pure
 accounting/bookkeeping over an injected ``storage`` mapping (the wallet DB's
@@ -17,7 +19,8 @@ Lifecycle of one entry, keyed by the invoice payment hash (``rhash``):
 
   remember()  -> awaiting payment (``due=False``); dropped by sweep() if the
                  invoice expires unpaid.
-  mark_due()  -> the invoice was paid; a receipt is now owed (``due=True``).
+  mark_due()  -> the invoice was paid; a receipt is now owed (``due=True``), and
+                 the settlement ``preimage`` is captured and persisted here.
                  Persisted *before* the send is attempted, so a crash or relay
                  failure mid-send still leaves the receipt owed.
   mark_sent() -> the receipt reached the relay; entry removed.
@@ -50,6 +53,7 @@ class ReceiptTarget:
     request_event_id: str
     attempts: int = 0
     due_since: float = 0.0
+    preimage: Optional[str] = None
 
 
 class ReceiptRegistry:
@@ -87,6 +91,7 @@ class ReceiptRegistry:
             request_event_id=str(entry.get("req", "")),
             attempts=int(entry.get("attempts", 0)),
             due_since=float(entry.get("due_since", 0.0)),
+            preimage=entry.get("preimage"),
         )
 
     # --- lifecycle -------------------------------------------------------
@@ -123,12 +128,17 @@ class ReceiptRegistry:
         if entries.pop(rhash, None) is not None:
             self._save(entries)
 
-    def mark_due(self, rhash: str) -> Optional[ReceiptTarget]:
+    def mark_due(self, rhash: str, preimage: Optional[str] = None) -> Optional[ReceiptTarget]:
         """The invoice was paid: a receipt is now owed. Returns its target.
 
-        Returns ``None`` when ``rhash`` is not one of ours (e.g. a payment to an
-        invoice we did not issue for an offer). Persists the owed state *before*
-        any send is attempted, so the receipt survives a failed/dropped delivery.
+        ``preimage`` is the hex Lightning preimage proving the payment settled
+        (CLINK spec: standard payments MUST carry it in the receipt; ``None``
+        signals an internal settlement). Captured now — while the wallet still
+        answers — and persisted with the owed entry, so a retried delivery hours
+        later sends the same receipt. Returns ``None`` when ``rhash`` is not one
+        of ours (e.g. a payment to an invoice we did not issue for an offer).
+        Persists the owed state *before* any send is attempted, so the receipt
+        survives a failed/dropped delivery.
         """
         entries = self._load()
         entry = entries.get(rhash)
@@ -137,6 +147,8 @@ class ReceiptRegistry:
         if not entry.get("due"):
             entry["due"] = True
             entry["due_since"] = float(self._now_fn())
+        if preimage:
+            entry["preimage"] = preimage
         self._save(entries)
         return self._target(rhash, entry)
 
