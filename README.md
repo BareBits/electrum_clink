@@ -84,6 +84,15 @@ An *optional* .1% dev fee is included by default, which can be disabled in the s
   CLINK tab (with a ⚠ marker on affected offers) and a log warning — the relay
   selection is never changed behind your back. On demand: `clink_check_relays`.
   See `liveness.py`.
+* **Resilient listener lifecycle.** Closing another wallet — or closing and
+  reopening the plugin's own wallet (system tray, daemon
+  `close_wallet`/`load_wallet`) — restarts the request listener instead of
+  silently killing it for the rest of the session. A 60 s watchdog re-attaches
+  any pinned relay that was dropped after a transient connect failure, and a
+  relay that *rejects* a publish (NIP-20 `OK false`) is reported as an explicit
+  "relay refused" failure — with the relay's reason — in the noffer self-test
+  and the log, instead of masquerading as a generic "no response". See
+  `publish.py` and the lifecycle handling in `clink_plugin.py`.
 * **Debits / management** (`ndebit` / `nmanage`) are **not** implemented yet;
   they are stubbed via the protocol's "unsupported feature" path so they can be
   added without restructuring.

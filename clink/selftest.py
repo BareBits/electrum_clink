@@ -40,6 +40,7 @@ from electrum_aionostr.key import PrivateKey
 
 from . import nip44
 from .noffer import Noffer, noffer_decode
+from .publish import add_event_checked
 
 # CLINK request/response event kind (same value as clink_plugin; duplicated so
 # this module carries no dependency on the plugin runtime).
@@ -277,7 +278,10 @@ async def check_noffer(
     )
 
     async def publish() -> str:
-        return await aionostr._add_event(
+        # Checked publish: a relay that answers ``OK false`` (kind not allowed,
+        # rate limited, …) raises PublishRejected with the relay's reason, so
+        # the check reports PUBLISH_FAILED instead of a misleading NO_RESPONSE.
+        return await add_event_checked(
             manager,
             kind=CLINK_EVENT_KIND,
             tags=[["p", noffer.pubkey], ["clink_version", CLINK_VERSION]],

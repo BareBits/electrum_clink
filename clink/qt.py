@@ -115,8 +115,12 @@ class Plugin(ClinkPlugin):
             window.tabs.addTab(self._tab, read_QIcon("tab_send.png"), _("CLINK"))
 
     @hook
-    def close_wallet(self, *args, **kwargs):
-        if self._tab is not None:
+    def close_wallet(self, wallet: Optional["Abstract_Wallet"] = None, *args, **kwargs):
+        # Drop the tab only when the wallet of the window hosting it closes;
+        # a close of some *other* wallet must leave both the tab and (via the
+        # base hook's own wallet check) the running server untouched.
+        if self._tab is not None and (
+                wallet is None or getattr(self._tab.window, "wallet", None) is wallet):
             try:
                 window = self._tab.window
                 idx = window.tabs.indexOf(self._tab)
@@ -125,7 +129,7 @@ class Plugin(ClinkPlugin):
             except Exception:
                 pass
             self._tab = None
-        ClinkPlugin.close_wallet(self, *args, **kwargs)
+        ClinkPlugin.close_wallet(self, wallet, *args, **kwargs)
 
 
 class ClinkTab(QWidget):
