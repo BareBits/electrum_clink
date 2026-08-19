@@ -571,3 +571,49 @@ def test_devfee_accrues_and_pays_out(rig) -> None:
     # The payout was within the 10,000 sat/day cap and debited the owed balance.
     assert status["paid_last_24h_sat"] <= 10_000, status
     assert status["owed_sat"] < owed_before + expected_fee, status
+
+
+def test_wallet_reload_keeps_offers_payable(rig) -> None:
+    """Regression: a wallet close/reload used to kill the CLINK listener for
+    the rest of the session (sticky ``initialized`` flag, and the daemon path
+    never even fires the Qt ``close_wallet`` hook). Every UI surface kept
+    working — offers created, probes green — but "Check noffers" reported
+    ``no_response`` on every relay and payers never got invoices until a full
+    restart. After a reload the plugin must detect the fresh wallet object,
+    restart its server, and keep answering for previously handed-out noffers.
+
+    Runs last in this module: the reload briefly takes the daemon's wallet
+    (and its Lightning node) down.
+    """
+    wallet_path = str(RIG_DIR / ".run" / "electrum" / "regtest" / "wallets" / "clink_test")
+    created = json.loads(_electrum_cli("clink_add_offer", "--label", "reload"))
+    noffer = created["noffer"]
+
+    # Sanity: payable before the reload.
+    resp = asyncio.run(request_invoice(noffer, amount_sats=1, timeout=30))
+    assert "bolt11" in resp, resp
+
+    # Daemon-style reload: no Qt close hook fires; the plugin only sees
+    # daemon_wallet_loaded with a new wallet object for the same file.
+    assert _electrum_cli("close_wallet", "-w", wallet_path) == "true"
+    _electrum_cli("load_wallet", "-w", wallet_path)
+
+    # The restarted server polls its prerequisites every 5s, then must
+    # reconnect to the relay and answer for the *pre-reload* noffer.
+    deadline = time.monotonic() + 90
+    last: Dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        try:
+            last = asyncio.run(request_invoice(noffer, amount_sats=1, timeout=15))
+        except Exception as e:  # relay/subscription may still be coming up
+            last = {"error": repr(e)}
+        if "bolt11" in last:
+            break
+        time.sleep(3)
+    assert "bolt11" in last, f"offer unpayable after wallet reload: {last}"
+
+    # The round-trip self-test agrees (this is what the user sees in the tab).
+    # Only this test's offer is checked: earlier tests in the shared rig
+    # session leave offers deliberately pinned to relays they already stopped.
+    checked = json.loads(_electrum_cli("clink_check_noffers", "--offer_id", created["offer_id"]))
+    assert checked[created["offer_id"]]["ok"] is True, checked

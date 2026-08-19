@@ -36,6 +36,8 @@ from urllib.parse import urlsplit
 import electrum_aionostr as aionostr
 from electrum_aionostr.key import PrivateKey
 
+from .publish import add_event_checked
+
 # CLINK request/response event kind. Duplicated from clink_plugin (rather than
 # imported) so this module carries no dependency on the plugin runtime.
 CLINK_EVENT_KIND = 21001
@@ -224,7 +226,9 @@ async def probe_relay_payable(
     writer = make_manager(writer_sk.hex())
 
     async def publish() -> Any:
-        return await aionostr._add_event(
+        # Checked publish: a rejecting relay fails the probe with the relay's
+        # stated reason instead of timing out into a bare ``no_readback``.
+        return await add_event_checked(
             writer,
             kind=CLINK_EVENT_KIND,
             tags=[["p", reader_pub]],

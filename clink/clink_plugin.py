@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 import electrum_aionostr as aionostr
 from electrum_aionostr.event import Event as nEvent
 from electrum_aionostr.key import PrivateKey
+from electrum_aionostr.util import normalize_url
 
 from electrum.logging import Logger
 from electrum.plugin import BasePlugin, hook
@@ -46,6 +47,7 @@ from electrum.util import (
 
 from . import nip44, protocol
 from .devfee import MIN_PAYOUT_SAT, DevFeeLedger
+from .publish import PublishRejected, add_event_checked
 from .liquidity import LiquidityReserver, receivable_capacity_sat
 from .liveness import LivenessResult, RelayLivenessMonitor
 from .noffer import Noffer, OfferPriceType, noffer_encode
@@ -84,6 +86,12 @@ RELAY_CACHE_TTL_SEC = 24 * 60 * 60
 # Self-test payer identities expire after this long even if the checker never
 # unregistered them (crash safety) — comfortably above the check timeout.
 SELFTEST_PAYER_TTL_SEC = 120
+# How often the listener re-checks that it actually sits on every relay it
+# should. Manager.connect() silently drops relays it could not reach and never
+# retries them on its own — without this, a pinned relay with a transient
+# outage at (re)connect time would leave its offers silently unpayable for the
+# rest of the session.
+RELAY_WATCHDOG_INTERVAL_SEC = 60
 
 
 class ClinkServer(Logger, EventListener):
@@ -430,13 +438,23 @@ class ClinkServer(Logger, EventListener):
             proxy=factory() if factory else None,
         )
 
+    def listener_prerequisites_met(self) -> bool:
+        """Whether the listener has everything it needs to come up.
+
+        Gates on :meth:`listen_relay_urls` — what the listener will actually
+        sit on — not on the raw config relay list: an offer pinned to a custom
+        relay must be served even when ``NOSTR_RELAYS`` is empty (the old
+        ``relay_url`` gate silently never started the listener then).
+        """
+        return bool(self.listen_relay_urls()
+                    and self.wallet.network
+                    and self.wallet.network.is_connected()
+                    and self.wallet.lnworker)
+
     @log_exceptions
     async def run(self) -> None:
         while True:
-            while (not self.relay_url
-                       or not self.wallet.network
-                       or not self.wallet.network.is_connected()
-                       or not self.wallet.lnworker):
+            while not self.listener_prerequisites_met():
                 if self.do_stop:
                     return
                 await asyncio.sleep(5)
@@ -448,6 +466,7 @@ class ClinkServer(Logger, EventListener):
                 async with OldTaskGroup() as tg:
                     self.taskgroup = tg
                     await tg.spawn(self.handle_requests())
+                    await tg.spawn(self._relay_watchdog())
                     await tg.spawn(self._devfee_startup_check())
                     await tg.spawn(self._redeliver_receipts())
             except asyncio.CancelledError:
@@ -485,6 +504,39 @@ class ClinkServer(Logger, EventListener):
     def restart_event_handler(self) -> None:
         if tg := self.taskgroup:
             asyncio.run_coroutine_threadsafe(tg.cancel_remaining(), get_asyncio_loop())
+
+    async def ensure_listener_relays(self) -> None:
+        """Re-attach the listener to any relay it should sit on but lost.
+
+        ``Manager.connect()`` drops relays it could not reach from
+        ``manager.relays`` and never retries them, while ``_manager_relays``
+        records the *requested* set — so :meth:`refresh_manager` sees no drift
+        and a pinned relay that was down for a moment at (re)connect time
+        would otherwise stay missing (its offers silently unpayable) for the
+        rest of the session. Called periodically by :meth:`_relay_watchdog`.
+        """
+        manager = self.manager
+        if manager is None or not manager.connected:
+            return
+        desired = {normalize_url(u) for u in self.listen_relay_urls()}
+        connected = {relay.url for relay in manager.relays}
+        if connected >= desired:
+            return
+        missing = sorted(desired - connected)
+        self.logger.info(
+            f"listener is missing relay(s) {', '.join(missing)}; reconnecting")
+        # update_relays connects the missing relays and re-issues the open
+        # subscriptions on them; ones still down are dropped again and simply
+        # retried on the next watchdog tick.
+        await manager.update_relays(sorted(desired))
+
+    async def _relay_watchdog(self) -> None:
+        while True:
+            await asyncio.sleep(RELAY_WATCHDOG_INTERVAL_SEC)
+            try:
+                await self.ensure_listener_relays()
+            except Exception:
+                self.logger.exception("error reconnecting listener relays")
 
     # --- request handling ------------------------------------------------
 
@@ -655,10 +707,23 @@ class ClinkServer(Logger, EventListener):
         tg = self.taskgroup
         if tg is None:
             return
-        await tg.spawn(aionostr._add_event(
-            self.manager,
-            **self._encrypt_event_args(request_event.pubkey, request_event.id, payload),
-        ))
+        await tg.spawn(self._publish_response(request_event, payload))
+
+    async def _publish_response(self, request_event: nEvent, payload: Dict[str, Any]) -> None:
+        """Encrypt and publish a response, surfacing relay rejections.
+
+        A rejection (``OK false``) is logged with the relay's reason instead of
+        passing silently; other failures (timeout, connection trouble) keep
+        their old behaviour — the exception restarts the event handler, which
+        reconnects the relays.
+        """
+        try:
+            await add_event_checked(self.manager, **self._encrypt_event_args(
+                request_event.pubkey, request_event.id, payload))
+        except PublishRejected as e:
+            self.logger.warning(
+                f"relay rejected our response to {request_event.id[:10]}…: {e}")
+            self._record("response", None, f"relay rejected response: {e}")
 
     def _delete_stale_request(self, rhash: str) -> None:
         """Garbage-collect the wallet request behind a dropped registry entry.
@@ -692,7 +757,10 @@ class ClinkServer(Logger, EventListener):
         if self.manager is None:
             return False
         try:
-            await asyncio.wait_for(aionostr._add_event(
+            # Checked publish: an ``OK false`` counts as a failed delivery (and
+            # names the relay's reason in the retry log) instead of silently
+            # marking an undelivered receipt as sent.
+            await asyncio.wait_for(add_event_checked(
                 self.manager,
                 **self._encrypt_event_args(
                     target.payer_pubkey, target.request_event_id, protocol.receipt_payload()),
@@ -872,31 +940,77 @@ class ClinkPlugin(BasePlugin):
         BasePlugin.__init__(self, parent, config, name)
         self.config = config
         self.server: Optional[ClinkServer] = None
-        self.taskgroup = OldTaskGroup()
-        self.initialized = False
+        self.taskgroup: OldTaskGroup = OldTaskGroup()
 
-    def start_plugin(self, wallet: "Abstract_Wallet"):
+    @staticmethod
+    def _wallet_file(wallet: "Abstract_Wallet") -> Optional[str]:
+        """The wallet's on-disk path, used as its stable identity across
+        close/reopen cycles (each reload builds a fresh wallet object)."""
+        try:
+            return wallet.storage.path if wallet.storage else None
+        except Exception:
+            return None
+
+    def start_plugin(self, wallet: "Abstract_Wallet") -> None:
         if not wallet.has_lightning():
             self.logger.info("wallet has no lightning; CLINK offers need it to issue invoices")
             return
-        if self.initialized:
-            return  # only drive a single wallet
+        server = self.server
+        if server is not None:
+            if server.wallet is wallet:
+                return  # already driving this very wallet
+            same_file = (self._wallet_file(server.wallet) is not None
+                         and self._wallet_file(server.wallet) == self._wallet_file(wallet))
+            if not same_file:
+                return  # only drive a single wallet
+            # Same wallet file, new object: the wallet was closed and reopened
+            # without the Qt close hook firing (daemon close_wallet/load_wallet
+            # never fires it). The old server drives a dead wallet — replace it,
+            # or offers would silently stop being answered until a full restart.
+            self.logger.info("driven wallet was reloaded; restarting the CLINK server")
+            self._stop_server()
+        # A fresh taskgroup per server generation: the old one was cancelled
+        # when its server stopped and must not adopt the new run loop.
+        self.taskgroup = OldTaskGroup()
         self.server = ClinkServer(self.config, wallet, self)
-        asyncio.run_coroutine_threadsafe(
-            self.taskgroup.spawn(self.server.run()), get_asyncio_loop())
-        self.initialized = True
+        self._run_async(self.taskgroup.spawn(self.server.run()))
         self.logger.info("CLINK plugin started")
 
+    def _run_async(self, coro: Any) -> None:
+        """Schedule ``coro`` on Electrum's asyncio loop (patchable in tests)."""
+        asyncio.run_coroutine_threadsafe(coro, get_asyncio_loop())
+
+    def _stop_server(self) -> None:
+        """Stop and detach the current server (idempotent, restartable).
+
+        Unlike the pre-0.0.7 close path this leaves the plugin restartable: a
+        later ``start_plugin`` builds a fresh server and taskgroup instead of
+        being blocked by a sticky ``initialized`` flag.
+        """
+        server, taskgroup = self.server, self.taskgroup
+        self.server = None
+        if server is None:
+            return
+        server.do_stop = True
+        server.unregister_callbacks()
+
+        async def close() -> None:
+            if server.manager:
+                await server.manager.close()
+            await taskgroup.cancel_remaining()
+        self._run_async(close())
+
     @hook
-    def close_wallet(self, *args, **kwargs):
-        async def close():
-            if self.server:
-                self.server.do_stop = True
-                self.server.unregister_callbacks()
-                if self.server.manager:
-                    await self.server.manager.close()
-            await self.taskgroup.cancel_remaining()
-        asyncio.run_coroutine_threadsafe(close(), get_asyncio_loop())
+    def close_wallet(self, wallet: Optional["Abstract_Wallet"] = None, *args, **kwargs):
+        # Only a close of the wallet we drive stops the server: closing some
+        # *other* wallet window used to kill the listener for the rest of the
+        # session (offers kept looking fine but no request was ever answered).
+        server = self.server
+        if server is None:
+            return
+        if wallet is not None and server.wallet is not wallet:
+            return
+        self._stop_server()
 
     # --- API used by cmdline + Qt ----------------------------------------
 
