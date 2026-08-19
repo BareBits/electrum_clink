@@ -69,7 +69,7 @@ SimpleConfig.CLINK_RELAY = ConfigVar(
 # How long an issued invoice stays valid AND its inbound liquidity stays locked.
 SimpleConfig.CLINK_INVOICE_EXPIRY = ConfigVar(
     key="plugins.clink.invoice_expiry_sec",
-    default=120,
+    default=300,
     type_=int,
     plugin=plugin_name,
 )

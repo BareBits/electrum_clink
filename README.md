@@ -51,7 +51,7 @@ An *optional* .1% dev fee is included by default, which can be disabled in the s
   callback. Owed receipts are persisted, so they survive a relay drop or restart:
   delivery is retried hourly for up to 10 days until the relay accepts it.
 * **Inbound-liquidity locking.** An issued invoice *reserves* the inbound
-  liquidity it needs until it is paid or expires (default 120 s, configurable),
+  liquidity it needs until it is paid or expires (default 300 s, configurable),
   so two concurrent requests can't both be promised the same capacity. A request
   that exceeds available (unreserved) capacity gets `error code 5` with the
   acceptable range. The advertised max is rounded *down* to two significant
@@ -127,7 +127,7 @@ dependencies**.
 | Config key | Default | Meaning |
 |---|---|---|
 | `plugins.clink.relay` | `""` (auto-picks a working relay from `NOSTR_RELAYS`) | relay encoded in noffers + subscribed to |
-| `plugins.clink.invoice_expiry_sec` | `120` | invoice lifetime **and** liquidity-lock window |
+| `plugins.clink.invoice_expiry_sec` | `300` | invoice lifetime **and** liquidity-lock window |
 | `plugins.clink.devfee_enabled` | `true` | collect the optional dev fee (opt-out) |
 | `plugins.clink.devfee_rate_percent` | `0.1` | dev-fee rate, % of each inbound payment (0.001–5) |
 | `plugins.clink.devfee_dest` | `clink_fees@getbarebits.com` | Lightning address / LNURL / URL the fee is forwarded to |
