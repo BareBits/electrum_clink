@@ -14,6 +14,7 @@ import json
 import ssl
 import time
 from collections import OrderedDict, deque
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 import electrum_aionostr as aionostr
@@ -52,7 +53,8 @@ from .liquidity import LiquidityReserver, receivable_capacity_sat
 from .liveness import LivenessResult, RelayLivenessMonitor
 from .noffer import Noffer, OfferPriceType, noffer_encode
 from .offers import Offer, OfferStore, advertised_relay, advertised_relays, listen_relays
-from .receipts import RETRY_INTERVAL_SEC, ReceiptRegistry, ReceiptTarget
+from .receipts import (RESEND_OFFSETS_SEC, RETRY_INTERVAL_SEC,
+                       ReceiptRegistry, ReceiptTarget)
 from .relay_probe import (
     ProbeResult,
     RelaySelection,
@@ -133,6 +135,11 @@ class ClinkServer(Logger, EventListener):
         # Receipts owed to payers once their invoices settle. Persisted so a
         # receipt survives relay drops / restarts between payment and delivery.
         self.receipts = ReceiptRegistry(storage, clock_fn=time.time)
+        # Payment hashes with an in-session re-broadcast tail scheduled, so the
+        # immediate-delivery path and the redelivery tick can't stack duplicate
+        # tails for the same receipt. Session-only: after a restart the
+        # registry's due_targets resumes any interrupted schedule.
+        self._receipt_tails: "set[str]" = set()
         # Serialise payout attempts so a post-payment trigger can't race the
         # startup check into two concurrent sends.
         self._devfee_lock = asyncio.Lock()
@@ -749,9 +756,12 @@ class ClinkServer(Logger, EventListener):
         """Publish the ``{"res":"ok"}`` receipt for a settled invoice.
 
         Best-effort and idempotent: stamps the attempt first (so a failure waits
-        a full retry interval), awaits the relay publish, and only on success
-        removes the owed entry. Never raises — a failure leaves the receipt owed
-        for the periodic retry loop.
+        a full retry interval), awaits the relay publish, and on success records
+        the send — the receipt is an ephemeral event the payer may have missed,
+        so the entry stays owed and a re-broadcast tail is scheduled until the
+        :data:`~clink.receipts.RESEND_OFFSETS_SEC` schedule completes (see the
+        README's "Receipt re-broadcasts" section). Never raises — a failure
+        leaves the receipt owed for the periodic retry loop.
         """
         self.receipts.record_attempt(target.rhash)
         if self.manager is None:
@@ -770,11 +780,47 @@ class ClinkServer(Logger, EventListener):
                 f"receipt delivery failed for {target.rhash[:10]}… "
                 f"(attempt {target.attempts + 1}); will retry: {e!r}")
             return False
-        self.receipts.mark_sent(target.rhash)
-        self.logger.info(f"receipt delivered to {target.payer_pubkey[:10]}… "
-                         f"for {target.rhash[:10]}…")
-        self._record("receipt", None, "receipt sent ✓")
+        next_delay = self.receipts.record_send(target.rhash)
+        if target.sends == 0:
+            self.logger.info(
+                f"receipt delivered to {target.payer_pubkey[:10]}… for "
+                f"{target.rhash[:10]}…; re-broadcasting {len(RESEND_OFFSETS_SEC)}x "
+                f"in case the payer missed it")
+            self._record("receipt", None, "receipt sent ✓")
+        else:
+            self.logger.debug(
+                f"receipt re-broadcast {target.sends + 1}/{len(RESEND_OFFSETS_SEC) + 1} "
+                f"for {target.rhash[:10]}…")
+        if next_delay is not None:
+            await self._schedule_receipt_rebroadcast(
+                replace(target, sends=target.sends + 1), next_delay)
         return True
+
+    async def _schedule_receipt_rebroadcast(self, target: ReceiptTarget,
+                                            delay: float) -> None:
+        """Spawn the re-broadcast tail for ``target``, at most one per rhash."""
+        tg = self.taskgroup
+        if tg is None or target.rhash in self._receipt_tails:
+            return
+        self._receipt_tails.add(target.rhash)
+        await tg.spawn(self._rebroadcast_receipt_later(target, delay))
+
+    async def _rebroadcast_receipt_later(self, target: ReceiptTarget,
+                                         delay: float) -> None:
+        """Sleep out one schedule step, then re-broadcast if still owed.
+
+        Runs inside the relay taskgroup: a disconnect cancels the sleep, and the
+        registry's due_targets resumes the schedule on reconnect instead.
+        """
+        try:
+            await asyncio.sleep(delay)
+        finally:
+            # Clear the guard before delivering — a successful delivery
+            # schedules the *next* tail, which must not be blocked by this one.
+            self._receipt_tails.discard(target.rhash)
+        if not self.receipts.is_owed(target.rhash):
+            return  # completed (or abandoned) by another path meanwhile
+        await self._deliver_receipt(target)
 
     async def _redeliver_receipts(self) -> None:
         """Retry any owed receipts now and hourly thereafter.

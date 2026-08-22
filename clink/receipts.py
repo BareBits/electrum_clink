@@ -15,16 +15,23 @@ dict. All relay/crypto I/O lives in the runtime.
 
 Lifecycle of one entry, keyed by the invoice payment hash (``rhash``):
 
-  remember()  -> awaiting payment (``due=False``); dropped by sweep() if the
-                 invoice expires unpaid.
-  mark_due()  -> the invoice was paid; a receipt is now owed (``due=True``).
-                 Persisted *before* the send is attempted, so a crash or relay
-                 failure mid-send still leaves the receipt owed.
-  mark_sent() -> the receipt reached the relay; entry removed.
+  remember()    -> awaiting payment (``due=False``); dropped by sweep() if the
+                   invoice expires unpaid.
+  mark_due()    -> the invoice was paid; a receipt is now owed (``due=True``).
+                   Persisted *before* the send is attempted, so a crash or relay
+                   failure mid-send still leaves the receipt owed.
+  record_send() -> a broadcast of the receipt reached the relay. Because the
+                   receipt is an ephemeral (kind-21001) event that relays don't
+                   store, one accepted broadcast only proves the *relay* saw it —
+                   not the payer. So the entry stays owed and the receipt is
+                   re-broadcast at each :data:`RESEND_OFFSETS_SEC` offset after
+                   the first accepted send; the final send removes the entry.
 
-A still-owed (``due``) receipt is retried at most once per
-:data:`RETRY_INTERVAL_SEC` and finally abandoned after
-:data:`RETRY_MAX_SEC`, so the map can never grow without bound.
+A still-owed (``due``) receipt that has never been successfully broadcast is
+retried at most once per :data:`RETRY_INTERVAL_SEC`; one mid re-broadcast
+schedule follows :data:`RESEND_OFFSETS_SEC` instead. Either way an owed entry
+is finally abandoned :data:`RETRY_MAX_SEC` after payment, so the map can never
+grow without bound.
 """
 
 from __future__ import annotations
@@ -37,6 +44,12 @@ from typing import Any, Callable, Dict, List, MutableMapping, Optional
 RETRY_INTERVAL_SEC: int = 60 * 60          # hourly
 # Give up on an owed receipt this long after the invoice was paid.
 RETRY_MAX_SEC: int = 10 * 24 * 60 * 60     # 10 days
+# After the first *successful* broadcast, re-broadcast the receipt once per
+# entry here (seconds after that first send) — 7 sends in total over 5
+# minutes. Receipts are ephemeral events, so a payer whose subscription was
+# down at the instant of a broadcast can only be reached by another one; see
+# the README's "Receipt re-broadcasts" section.
+RESEND_OFFSETS_SEC: "tuple[int, ...]" = (10, 15, 30, 60, 120, 300)
 # Hard cap on remembered entries, so unpaid/never-swept invoices can't grow the
 # map without limit; oldest-by-expiry are evicted first.
 MAX_PENDING: int = 1_000
@@ -50,6 +63,8 @@ class ReceiptTarget:
     request_event_id: str
     attempts: int = 0
     due_since: float = 0.0
+    # Successful broadcasts so far (0 = never reached the relay yet).
+    sends: int = 0
 
 
 class ReceiptRegistry:
@@ -87,6 +102,7 @@ class ReceiptRegistry:
             request_event_id=str(entry.get("req", "")),
             attempts=int(entry.get("attempts", 0)),
             due_since=float(entry.get("due_since", 0.0)),
+            sends=int(entry.get("sends", 0)),
         )
 
     # --- lifecycle -------------------------------------------------------
@@ -140,11 +156,44 @@ class ReceiptRegistry:
         self._save(entries)
         return self._target(rhash, entry)
 
-    def mark_sent(self, rhash: str) -> None:
-        """The receipt reached the relay: stop owing it."""
+    def record_send(self, rhash: str) -> Optional[float]:
+        """A broadcast of this receipt reached the relay (``OK true``).
+
+        Returns the delay in seconds until the next scheduled re-broadcast
+        (the next :data:`RESEND_OFFSETS_SEC` offset, measured from the *first*
+        accepted send — so a late re-broadcast doesn't push the rest of the
+        schedule out), or ``None`` when the schedule is complete — the final
+        send removes the entry, so nothing more is owed. Unknown ``rhash``
+        also returns ``None``.
+
+        One accepted broadcast proves only that the *relay* saw the receipt;
+        kind-21001 events are ephemeral (not stored), so a payer who wasn't
+        subscribed at that instant needs a later broadcast to ever learn the
+        invoice was paid. Hence the entry stays owed through
+        :data:`RESEND_OFFSETS_SEC`.
+        """
         entries = self._load()
-        if entries.pop(rhash, None) is not None:
+        entry = entries.get(rhash)
+        if entry is None:
+            return None
+        now = float(self._now_fn())
+        sends = int(entry.get("sends", 0)) + 1
+        if sends > len(RESEND_OFFSETS_SEC):
+            entries.pop(rhash, None)
             self._save(entries)
+            return None
+        entry["sends"] = sends
+        entry["last_send"] = now
+        if sends == 1:
+            entry["first_send"] = now
+        self._save(entries)
+        first = float(entry.get("first_send", now))
+        return max(0.0, first + RESEND_OFFSETS_SEC[sends - 1] - now)
+
+    def is_owed(self, rhash: str) -> bool:
+        """Whether a receipt is still owed (paid, schedule not yet complete)."""
+        entry = self._load().get(rhash)
+        return bool(entry and entry.get("due"))
 
     def record_attempt(self, rhash: str) -> None:
         """Stamp a delivery attempt so the next retry waits a full interval."""
@@ -159,17 +208,30 @@ class ReceiptRegistry:
     # --- retry queue -----------------------------------------------------
 
     def due_targets(self) -> List[ReceiptTarget]:
-        """Owed receipts whose retry interval has elapsed, after pruning.
+        """Owed receipts whose retry/re-broadcast interval has elapsed.
 
         Used by the runtime's periodic redelivery loop and on reconnect/startup.
-        An entry that has never been attempted (``last_attempt == 0``) is always
-        returned; otherwise it must be at least :data:`RETRY_INTERVAL_SEC` old.
+        A never-broadcast entry that has never been attempted
+        (``last_attempt == 0``) is always returned; otherwise it must be at
+        least :data:`RETRY_INTERVAL_SEC` old. An entry mid re-broadcast schedule
+        (``sends > 0``) follows :data:`RESEND_OFFSETS_SEC` instead — the
+        in-session cadence is driven by the runtime's scheduled tail, so this
+        path exists to *resume* an interrupted schedule after a restart or
+        reconnect.
         """
         entries, _expired = self._sweep(self._load())
         now = self._now_fn()
         out: List[ReceiptTarget] = []
         for rhash, entry in entries.items():
             if not entry.get("due"):
+                continue
+            sends = int(entry.get("sends", 0))
+            if sends > 0:
+                first = float(entry.get("first_send", entry.get("last_send", 0.0)))
+                offset = RESEND_OFFSETS_SEC[min(sends, len(RESEND_OFFSETS_SEC)) - 1]
+                if now - first < offset:
+                    continue
+                out.append(self._target(rhash, entry))
                 continue
             last = float(entry.get("last_attempt", 0.0))
             if last and now - last < RETRY_INTERVAL_SEC:
