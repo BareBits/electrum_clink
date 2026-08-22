@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from clink.receipts import (
+    FAIL_RETRY_BACKOFF_SEC,
+    FAST_RETRY_WINDOW_SEC,
     MAX_PENDING,
     RESEND_OFFSETS_SEC,
     RETRY_INTERVAL_SEC,
@@ -108,6 +110,61 @@ def test_abandoned_mid_schedule_after_retry_max() -> None:
     clock.tick(RETRY_MAX_SEC + 1)
     reg.sweep()
     assert reg.pending_count() == 0
+
+
+def test_fail_retry_delay_walks_backoff_and_caps() -> None:
+    # Consecutive failures walk FAIL_RETRY_BACKOFF_SEC and stay on the last
+    # entry; the streak is 1-based (first failure -> shortest backoff).
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("r", "p", "q", expires_at=clock() + 2_000)
+    reg.mark_due("r")
+    for streak, expected in enumerate(FAIL_RETRY_BACKOFF_SEC, start=1):
+        assert reg.fail_retry_delay("r", streak) == float(expected)
+    assert reg.fail_retry_delay("r", len(FAIL_RETRY_BACKOFF_SEC) + 5) == \
+        float(FAIL_RETRY_BACKOFF_SEC[-1])
+
+
+def test_fail_retry_window_anchored_to_payment_before_first_send() -> None:
+    # A never-sent receipt fast-retries only within the window after payment;
+    # afterwards the hourly loop is the retry path (None).
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("r", "p", "q", expires_at=clock() + 2_000)
+    reg.mark_due("r")
+    clock.tick(FAST_RETRY_WINDOW_SEC - 1)
+    assert reg.fail_retry_delay("r", 1) == float(FAIL_RETRY_BACKOFF_SEC[0])
+    clock.tick(2)
+    assert reg.fail_retry_delay("r", 1) is None
+
+
+def test_fail_retry_window_reanchors_to_first_send() -> None:
+    # A schedule that *starts* late (first accepted send long after payment)
+    # still gets fast retries: mid-schedule the window is measured from the
+    # first accepted send, not from payment.
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("r", "p", "q", expires_at=clock() + 120)
+    reg.mark_due("r")
+    clock.tick(FAST_RETRY_WINDOW_SEC + 100)   # payment-anchored window closed
+    assert reg.fail_retry_delay("r", 1) is None
+    reg.record_send("r")                       # schedule finally starts
+    clock.tick(FAST_RETRY_WINDOW_SEC - 1)
+    assert reg.fail_retry_delay("r", 1) == float(FAIL_RETRY_BACKOFF_SEC[0])
+    clock.tick(2)
+    assert reg.fail_retry_delay("r", 1) is None
+
+
+def test_fail_retry_delay_unknown_or_unpaid_returns_none() -> None:
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    assert reg.fail_retry_delay("never-issued", 1) is None
+    reg.remember("r", "p", "q", expires_at=clock() + 120)
+    assert reg.fail_retry_delay("r", 1) is None  # remembered but never paid
 
 
 def test_due_persists_across_reload() -> None:

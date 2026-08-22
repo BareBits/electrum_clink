@@ -126,6 +126,16 @@ observe the settlement. The schedule is bounded (seven sends, then done) and,
 as before, an owed receipt survives restarts: an interrupted schedule resumes
 on reconnect. See `RESEND_OFFSETS_SEC` in `receipts.py`.
 
+A *failed* receipt publish (a timeout, a transient network flake, a relay
+rejection) is also retried quickly rather than waiting for the hourly retry
+tick: for the first ~10 minutes after payment (or after the first accepted
+send, once the re-broadcast schedule is running) failures retry on a short
+exponential backoff — 5 s, 10 s, 20 s, 40 s, then every 80 s — and a success
+resets the backoff. Once that window closes, retries fall back to the hourly
+loop, so a relay that is down hard is never hammered for the full 10-day
+abandonment bound. See `FAIL_RETRY_BACKOFF_SEC` / `FAST_RETRY_WINDOW_SEC` in
+`receipts.py`.
+
 ## Layout
 
 ```

@@ -29,9 +29,12 @@ Lifecycle of one entry, keyed by the invoice payment hash (``rhash``):
 
 A still-owed (``due``) receipt that has never been successfully broadcast is
 retried at most once per :data:`RETRY_INTERVAL_SEC`; one mid re-broadcast
-schedule follows :data:`RESEND_OFFSETS_SEC` instead. Either way an owed entry
-is finally abandoned :data:`RETRY_MAX_SEC` after payment, so the map can never
-grow without bound.
+schedule follows :data:`RESEND_OFFSETS_SEC` instead. A *failed* publish inside
+the first :data:`FAST_RETRY_WINDOW_SEC` is additionally fast-retried on the
+:data:`FAIL_RETRY_BACKOFF_SEC` backoff (see :meth:`ReceiptRegistry.fail_retry_delay`),
+so a transient network flake never parks a receipt for a whole retry interval.
+Either way an owed entry is finally abandoned :data:`RETRY_MAX_SEC` after
+payment, so the map can never grow without bound.
 """
 
 from __future__ import annotations
@@ -50,6 +53,16 @@ RETRY_MAX_SEC: int = 10 * 24 * 60 * 60     # 10 days
 # down at the instant of a broadcast can only be reached by another one; see
 # the README's "Receipt re-broadcasts" section.
 RESEND_OFFSETS_SEC: "tuple[int, ...]" = (10, 15, 30, 60, 120, 300)
+# In-session backoff after a *failed* publish of an owed receipt, while the
+# entry is inside the fast-retry window below. Consecutive failures walk this
+# table (staying on the last entry); a successful publish resets the streak.
+FAIL_RETRY_BACKOFF_SEC: "tuple[int, ...]" = (5, 10, 20, 40, 80)
+# Failed publishes are fast-retried only this long after the entry's schedule
+# anchor (payment time for a never-sent receipt, first accepted send once the
+# re-broadcast schedule is running). Afterwards the hourly retry loop takes
+# over, so a relay that is down hard is never hammered for the full 10-day
+# abandonment bound.
+FAST_RETRY_WINDOW_SEC: int = RESEND_OFFSETS_SEC[-1] + 300  # 10 minutes
 # Hard cap on remembered entries, so unpaid/never-swept invoices can't grow the
 # map without limit; oldest-by-expiry are evicted first.
 MAX_PENDING: int = 1_000
@@ -194,6 +207,31 @@ class ReceiptRegistry:
         """Whether a receipt is still owed (paid, schedule not yet complete)."""
         entry = self._load().get(rhash)
         return bool(entry and entry.get("due"))
+
+    def fail_retry_delay(self, rhash: str, fail_streak: int) -> Optional[float]:
+        """Backoff before the next in-session retry of a *failed* publish.
+
+        ``fail_streak`` is the number of consecutive failed publishes so far,
+        including the one just observed (so the first failure passes ``1`` and
+        gets the shortest backoff). Returns ``None`` when the entry is not owed
+        or its :data:`FAST_RETRY_WINDOW_SEC` has closed — from then on the
+        hourly redelivery loop is the retry path, exactly as before fast
+        retries existed. The window is anchored to the first accepted send once
+        the re-broadcast schedule is running (so a schedule that *started* late
+        still gets fast retries), and to the payment time before that.
+        """
+        entry = self._load().get(rhash)
+        if not entry or not entry.get("due"):
+            return None
+        now = float(self._now_fn())
+        if int(entry.get("sends", 0)) > 0:
+            anchor = float(entry.get("first_send", 0.0))
+        else:
+            anchor = float(entry.get("due_since", 0.0))
+        if now - anchor >= FAST_RETRY_WINDOW_SEC:
+            return None
+        idx = min(max(fail_streak, 1), len(FAIL_RETRY_BACKOFF_SEC)) - 1
+        return float(FAIL_RETRY_BACKOFF_SEC[idx])
 
     def record_attempt(self, rhash: str) -> None:
         """Stamp a delivery attempt so the next retry waits a full interval."""

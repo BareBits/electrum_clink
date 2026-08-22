@@ -752,16 +752,20 @@ class ClinkServer(Logger, EventListener):
 
     # --- payment receipts ------------------------------------------------
 
-    async def _deliver_receipt(self, target: ReceiptTarget) -> bool:
+    async def _deliver_receipt(self, target: ReceiptTarget,
+                               fail_streak: int = 0) -> bool:
         """Publish the ``{"res":"ok"}`` receipt for a settled invoice.
 
-        Best-effort and idempotent: stamps the attempt first (so a failure waits
-        a full retry interval), awaits the relay publish, and on success records
-        the send — the receipt is an ephemeral event the payer may have missed,
-        so the entry stays owed and a re-broadcast tail is scheduled until the
+        Best-effort and idempotent: stamps the attempt first, awaits the relay
+        publish, and on success records the send — the receipt is an ephemeral
+        event the payer may have missed, so the entry stays owed and a
+        re-broadcast tail is scheduled until the
         :data:`~clink.receipts.RESEND_OFFSETS_SEC` schedule completes (see the
-        README's "Receipt re-broadcasts" section). Never raises — a failure
-        leaves the receipt owed for the periodic retry loop.
+        README's "Receipt re-broadcasts" section). A *failed* publish inside
+        the fast-retry window schedules a short-backoff retry tail
+        (``fail_streak`` counts the consecutive failures that produced the
+        current backoff; a success resets it); outside the window the hourly
+        redelivery loop takes over. Never raises.
         """
         self.receipts.record_attempt(target.rhash)
         if self.manager is None:
@@ -776,9 +780,18 @@ class ClinkServer(Logger, EventListener):
                     target.payer_pubkey, target.request_event_id, protocol.receipt_payload()),
             ), timeout=30)
         except Exception as e:
-            self.logger.warning(
-                f"receipt delivery failed for {target.rhash[:10]}… "
-                f"(attempt {target.attempts + 1}); will retry: {e!r}")
+            retry_delay = self.receipts.fail_retry_delay(target.rhash, fail_streak + 1)
+            if retry_delay is not None:
+                self.logger.warning(
+                    f"receipt delivery failed for {target.rhash[:10]}… "
+                    f"(attempt {target.attempts + 1}); retrying in "
+                    f"{retry_delay:.0f}s: {e!r}")
+                await self._schedule_receipt_rebroadcast(
+                    target, retry_delay, fail_streak=fail_streak + 1)
+            else:
+                self.logger.warning(
+                    f"receipt delivery failed for {target.rhash[:10]}… "
+                    f"(attempt {target.attempts + 1}); will retry hourly: {e!r}")
             return False
         next_delay = self.receipts.record_send(target.rhash)
         if target.sends == 0:
@@ -797,17 +810,19 @@ class ClinkServer(Logger, EventListener):
         return True
 
     async def _schedule_receipt_rebroadcast(self, target: ReceiptTarget,
-                                            delay: float) -> None:
-        """Spawn the re-broadcast tail for ``target``, at most one per rhash."""
+                                            delay: float, *,
+                                            fail_streak: int = 0) -> None:
+        """Spawn the re-broadcast/retry tail for ``target``, one per rhash."""
         tg = self.taskgroup
         if tg is None or target.rhash in self._receipt_tails:
             return
         self._receipt_tails.add(target.rhash)
-        await tg.spawn(self._rebroadcast_receipt_later(target, delay))
+        await tg.spawn(self._rebroadcast_receipt_later(target, delay, fail_streak))
 
     async def _rebroadcast_receipt_later(self, target: ReceiptTarget,
-                                         delay: float) -> None:
-        """Sleep out one schedule step, then re-broadcast if still owed.
+                                         delay: float,
+                                         fail_streak: int = 0) -> None:
+        """Sleep out one schedule/backoff step, then re-send if still owed.
 
         Runs inside the relay taskgroup: a disconnect cancels the sleep, and the
         registry's due_targets resumes the schedule on reconnect instead.
@@ -820,7 +835,7 @@ class ClinkServer(Logger, EventListener):
             self._receipt_tails.discard(target.rhash)
         if not self.receipts.is_owed(target.rhash):
             return  # completed (or abandoned) by another path meanwhile
-        await self._deliver_receipt(target)
+        await self._deliver_receipt(target, fail_streak)
 
     async def _redeliver_receipts(self) -> None:
         """Retry any owed receipts now and hourly thereafter.
