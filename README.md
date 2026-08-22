@@ -49,7 +49,10 @@ An *optional* .1% dev fee is included by default, which can be disabled in the s
   the payer a follow-up kind-`21001` event whose decrypted body is `{"res":"ok"}`
   — the receipt the reference `@shocknet/clink-sdk` surfaces via its `onReceipt`
   callback. Owed receipts are persisted, so they survive a relay drop or restart:
-  delivery is retried hourly for up to 10 days until the relay accepts it.
+  delivery is retried hourly for up to 10 days until the relay accepts it, and
+  each accepted receipt is then **re-broadcast several times** over the following
+  minutes — see [Receipt re-broadcasts](#receipt-re-broadcasts) below for why
+  this deliberate deviation from the reference behaviour exists.
 * **Inbound-liquidity locking.** An issued invoice *reserves* the inbound
   liquidity it needs until it is paid or expires (default 300 s, configurable),
   so two concurrent requests can't both be promised the same capacity. A request
@@ -96,6 +99,32 @@ An *optional* .1% dev fee is included by default, which can be disabled in the s
 * **Debits / management** (`ndebit` / `nmanage`) are **not** implemented yet;
   they are stubbed via the protocol's "unsupported feature" path so they can be
   added without restructuring.
+
+## Receipt re-broadcasts
+
+This plugin deviates slightly from the CLINK reference implementation, which
+publishes a payment receipt exactly once: here, each receipt is re-broadcast a
+few extra times over the first minutes after payment (10 s, 15 s, 30 s, 1 m,
+2 m and 5 m after the first accepted broadcast).
+
+Why: receipts are kind-`21001` events, which sit in Nostr's *ephemeral* range —
+relays deliver them to whoever is subscribed at that instant and are not
+expected to store them. A relay accepting the publish therefore proves nothing
+about the payer: if the payer's subscription happens to be down at that exact
+moment (a checkout page mid-reload, a phone that briefly lost signal, a
+payment processor that re-subscribes periodically instead of holding a socket
+open), a once-only receipt is lost for good — the invoice is paid, but the
+payer can keep showing "waiting for payment" forever. For a merchant that
+means support tickets and manual reconciliation for payments that actually
+succeeded.
+
+Re-broadcasting closes that window at no cost to compliant payers: every
+broadcast is the same NIP-44-encrypted `{"res":"ok"}` receipt for the same
+request, so a payer that already saw it treats the duplicates as idempotent
+noise, while a payer that missed the first one gets several more chances to
+observe the settlement. The schedule is bounded (seven sends, then done) and,
+as before, an owed receipt survives restarts: an interrupted schedule resumes
+on reconnect. See `RESEND_OFFSETS_SEC` in `receipts.py`.
 
 ## Layout
 

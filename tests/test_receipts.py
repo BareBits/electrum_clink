@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 
 from clink.receipts import (
     MAX_PENDING,
+    RESEND_OFFSETS_SEC,
     RETRY_INTERVAL_SEC,
     RETRY_MAX_SEC,
     ReceiptRegistry,
@@ -50,14 +51,63 @@ def test_mark_due_unknown_hash_returns_none() -> None:
     assert reg.mark_due("never-issued") is None
 
 
-def test_mark_sent_removes_entry() -> None:
+def test_record_send_walks_the_resend_schedule_then_removes() -> None:
+    # Each accepted broadcast returns the delay to the next one; the final
+    # send (len(schedule) + 1 in total) removes the entry.
     storage: Dict[str, Any] = {}
-    reg = _reg(storage, Clock())
-    reg.remember("r", "p", "q", expires_at=2_000)
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("r", "p", "q", expires_at=clock() + 2_000)
     reg.mark_due("r")
-    reg.mark_sent("r")
+    for expected in RESEND_OFFSETS_SEC:
+        assert reg.record_send("r") == float(expected)
+        assert reg.is_owed("r")
+    assert reg.record_send("r") is None  # schedule complete
     assert reg.pending_count() == 0
     assert reg.due_targets() == []
+    assert not reg.is_owed("r")
+
+
+def test_record_send_unknown_hash_returns_none() -> None:
+    reg = _reg({}, Clock())
+    assert reg.record_send("never-issued") is None
+
+
+def test_due_targets_follows_resend_schedule_after_first_send() -> None:
+    # Mid-schedule entries are throttled by RESEND_OFFSETS_SEC (not the
+    # hourly retry gate), so a restart/reconnect resumes the schedule.
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("r", "p", "q", expires_at=clock() + 2_000)
+    reg.mark_due("r")
+    reg.record_attempt("r")          # every publish stamps an attempt first
+    delay = reg.record_send("r")
+    assert delay == float(RESEND_OFFSETS_SEC[0])
+
+    # Within the scheduled delay -> not due (even though the hourly gate for
+    # attempted-but-never-sent entries would also block it).
+    clock.tick(delay - 1)
+    assert reg.due_targets() == []
+    # Past the delay -> due again, well before RETRY_INTERVAL_SEC.
+    clock.tick(2)
+    targets = reg.due_targets()
+    assert [t.rhash for t in targets] == ["r"]
+    assert targets[0].sends == 1
+
+
+def test_abandoned_mid_schedule_after_retry_max() -> None:
+    # A mid-schedule entry that can never re-broadcast (relay gone) is still
+    # bounded by RETRY_MAX_SEC like any owed receipt.
+    storage: Dict[str, Any] = {}
+    clock = Clock()
+    reg = _reg(storage, clock)
+    reg.remember("r", "p", "q", expires_at=clock() + 120)
+    reg.mark_due("r")
+    reg.record_send("r")
+    clock.tick(RETRY_MAX_SEC + 1)
+    reg.sweep()
+    assert reg.pending_count() == 0
 
 
 def test_due_persists_across_reload() -> None:
