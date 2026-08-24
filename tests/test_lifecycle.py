@@ -177,6 +177,75 @@ def test_daemon_reload_without_close_hook_swaps_the_server(plugin: ClinkPlugin) 
     assert stale.do_stop  # the stale server was stopped, not leaked
 
 
+def test_close_same_file_new_object_stops_stale_server(plugin: ClinkPlugin) -> None:
+    """A daemon reload swaps the wallet object without firing Qt hooks; when
+    the *reloaded* wallet later closes, the hook sees an object that is not
+    ``server.wallet`` but IS the same wallet file. The stale server must be
+    stopped — left running it is unreachable by any later hook and its run()
+    task would hang the process-exit teardown forever."""
+    plugin.start_plugin(_wallet("/w/a"))
+    stale = plugin.server
+    plugin.close_wallet(_wallet("/w/a"))  # same file, fresh object
+    assert plugin.server is None
+    assert stale.do_stop
+
+
+def test_close_same_file_unknown_path_leaves_server(plugin: ClinkPlugin) -> None:
+    """A wallet whose file path cannot be read is not proven to be ours —
+    stay conservative and keep the listener running."""
+    plugin.start_plugin(_wallet("/w/a"))
+    server = plugin.server
+    broken = _wallet("/w/a")
+    broken.storage = None  # _wallet_file() -> None
+    plugin.close_wallet(broken)
+    assert plugin.server is server
+    assert not server.do_stop
+
+
+def test_on_close_stops_server(plugin: ClinkPlugin) -> None:
+    """Disabling the plugin (BasePlugin.close -> on_close) unregisters every
+    hook first, so this is the last chance to stop the listener; without it
+    the server would keep answering offers and hang the eventual exit."""
+    plugin.start_plugin(_wallet("/w/a"))
+    server = plugin.server
+    plugin.on_close()
+    assert plugin.server is None
+    assert server.do_stop
+
+
+def test_stop_server_close_cancels_taskgroup_despite_manager_error(
+        plugin: ClinkPlugin) -> None:
+    """The scheduled close() must cancel the run() taskgroup even when the
+    relay-manager teardown raises — otherwise run() outlives the stop."""
+    import asyncio
+
+    plugin.start_plugin(_wallet("/w/a"))
+    server = plugin.server
+    cancelled: List[bool] = []
+
+    class ExplodingManager:
+        async def close(self) -> None:
+            raise RuntimeError("boom")
+
+    class RecordingGroup:
+        async def cancel_remaining(self) -> None:
+            cancelled.append(True)
+
+    server.manager = ExplodingManager()  # type: ignore[assignment]
+    plugin.taskgroup = RecordingGroup()  # type: ignore[assignment]
+
+    # Capture the close() coroutine instead of closing it (the default test
+    # harness _run_async closes captured coroutines unrun).
+    captured: List[Any] = []
+    plugin._run_async = captured.append  # type: ignore[method-assign]
+    plugin.close_wallet(server.wallet)
+
+    assert len(captured) == 1
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(captured[0])
+    assert cancelled == [True]
+
+
 def test_offers_survive_reload_via_stable_identity(plugin: ClinkPlugin) -> None:
     """The Nostr identity is derived from the LN node key, so a reloaded
     wallet answers for exactly the noffers handed out before the reload."""

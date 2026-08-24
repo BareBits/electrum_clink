@@ -458,6 +458,27 @@ class ClinkServer(Logger, EventListener):
                     and self.wallet.network.is_connected()
                     and self.wallet.lnworker)
 
+    @staticmethod
+    def _run_task_was_cancelled() -> bool:
+        """Whether *our own* task got ``.cancel()``'d (plugin stop, app
+        shutdown teardown) — as opposed to a ``CancelledError`` that bubbled
+        up out of a child of the inner taskgroup.
+
+        The distinction is what keeps Electrum's process exit working: at
+        shutdown the event-loop teardown cancels every task exactly once and
+        then waits for all of them (``electrum.util.run_event_loop``), so a
+        task that swallows that one cancel — as the restart-on-cancel loop
+        below used to — leaves the non-daemon EventLoop thread, and thus the
+        whole process, hanging forever.
+
+        On Python < 3.11 (no ``Task.cancelling``) every cancel counts as
+        external: hang-proof, at the cost of not auto-restarting after a
+        stray child cancellation.
+        """
+        task = asyncio.current_task()
+        cancelling = getattr(task, "cancelling", None)
+        return True if cancelling is None else cancelling() > 0
+
     @log_exceptions
     async def run(self) -> None:
         while True:
@@ -476,9 +497,12 @@ class ClinkServer(Logger, EventListener):
                     await tg.spawn(self._relay_watchdog())
                     await tg.spawn(self._devfee_startup_check())
                     await tg.spawn(self._redeliver_receipts())
+                # A requested restart (restart_event_handler) cancels the
+                # *children*, which OldTaskGroup.join skips over — the group
+                # exits normally and the while-loop rebuilds the listener.
             except asyncio.CancelledError:
-                if self.do_stop:
-                    return
+                if self.do_stop or self._run_task_was_cancelled():
+                    raise
                 self.logger.debug("Restarting clink event handler")
             except Exception as e:
                 self.logger.exception(f"Restarting clink event handler after exception: {e}")
@@ -1056,9 +1080,14 @@ class ClinkPlugin(BasePlugin):
         server.unregister_callbacks()
 
         async def close() -> None:
-            if server.manager:
-                await server.manager.close()
-            await taskgroup.cancel_remaining()
+            # The taskgroup must be cancelled even when the relay teardown
+            # errors: a still-running server.run() task past this point can
+            # only be reaped by the process-exit teardown.
+            try:
+                if server.manager:
+                    await server.manager.close()
+            finally:
+                await taskgroup.cancel_remaining()
         self._run_async(close())
 
     @hook
@@ -1070,7 +1099,25 @@ class ClinkPlugin(BasePlugin):
         if server is None:
             return
         if wallet is not None and server.wallet is not wallet:
-            return
+            # A different wallet *object* can still be the same wallet file,
+            # reopened behind our back (daemon close/load cycles never fire
+            # this hook): the server then drives a dead wallet, and skipping
+            # the stop here would leave it running — unstoppably — into the
+            # process-exit teardown. Only a genuinely different wallet file
+            # leaves the server alone.
+            ours = self._wallet_file(server.wallet)
+            theirs = self._wallet_file(wallet)
+            if ours is None or theirs is None or ours != theirs:
+                return
+        self._stop_server()
+
+    def on_close(self) -> None:
+        """Called by BasePlugin.close() when the plugin is disabled.
+
+        By then the hooks are already unregistered, so close_wallet can never
+        fire again — without this stop the listener would keep answering
+        offers while "disabled", and its run() task would hang process exit.
+        """
         self._stop_server()
 
     # --- API used by cmdline + Qt ----------------------------------------
