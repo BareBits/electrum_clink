@@ -733,11 +733,15 @@ class ClinkServer(Logger, EventListener):
     # --- request handling ------------------------------------------------
 
     async def handle_requests(self) -> None:
+        # ``since`` reaches back one freshness window (no ``limit: 0``), so a
+        # relay that buffers recent events replays requests published during a
+        # listener restart/reconnect gap instead of losing them. Redelivery is
+        # safe: _dispatch clamps freshness to MAX_REQUEST_AGE_SEC and the
+        # seen-events guard drops anything already answered this session.
         query = {
             "kinds": [CLINK_EVENT_KIND],
             "#p": [self.pubkey_hex],
-            "since": int(time.time()),
-            "limit": 0,
+            "since": int(time.time()) - MAX_REQUEST_AGE_SEC,
         }
         self.logger.info(f"listening for offers on {', '.join(self.listen_relay_urls())} as {self.pubkey_hex}")
         async for event in self.manager.get_events(query, single_event=False, only_stored=False):

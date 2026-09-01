@@ -746,8 +746,19 @@ def test_wallet_reload_keeps_offers_payable(rig) -> None:
     created = json.loads(_electrum_cli("clink_add_offer", "--label", "reload"))
     noffer = created["noffer"]
 
-    # Sanity: payable before the reload.
-    resp = asyncio.run(request_invoice(noffer, amount_sats=1, timeout=30))
+    # Sanity: payable before the reload. Retried because an earlier test's
+    # teardown may have just restarted the listener (offer removal does), and
+    # a request published into that reconnect window can need a second try.
+    deadline = time.monotonic() + 60
+    resp: Dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        try:
+            resp = asyncio.run(request_invoice(noffer, amount_sats=1, timeout=15))
+        except Exception as e:
+            resp = {"error": repr(e)}
+        if "bolt11" in resp:
+            break
+        time.sleep(3)
     assert "bolt11" in resp, resp
 
     # Daemon-style reload: no Qt close hook fires; the plugin only sees
