@@ -42,6 +42,9 @@ class FakeConfig:
     CLINK_DEVFEE_ENABLED = False
     CLINK_DEVFEE_RATE_PERCENT = 0.1
     CLINK_DEVFEE_DEST = ""
+    CLINK_WS_HEARTBEAT_SEC = 30
+    CLINK_WATCHDOG_INTERVAL_SEC = 60
+    CLINK_LISTENER_PING_INTERVAL_SEC = 300
 
     def get_nostr_relays(self) -> List[str]:
         return ["wss://relay.example.com"]

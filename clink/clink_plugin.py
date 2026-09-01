@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import secrets
 import ssl
 import time
 from collections import OrderedDict, deque
@@ -48,6 +49,7 @@ from electrum.util import (
 
 from . import nip44, protocol
 from .devfee import MIN_PAYOUT_SAT, DevFeeLedger
+from .nostr_transport import HeartbeatManager
 from .publish import PublishRejected, add_event_checked
 from .liquidity import LiquidityReserver, receivable_capacity_sat
 from .liveness import LivenessResult, RelayLivenessMonitor
@@ -88,12 +90,22 @@ RELAY_CACHE_TTL_SEC = 24 * 60 * 60
 # Self-test payer identities expire after this long even if the checker never
 # unregistered them (crash safety) — comfortably above the check timeout.
 SELFTEST_PAYER_TTL_SEC = 120
-# How often the listener re-checks that it actually sits on every relay it
-# should. Manager.connect() silently drops relays it could not reach and never
-# retries them on its own — without this, a pinned relay with a transient
-# outage at (re)connect time would leave its offers silently unpayable for the
-# rest of the session.
-RELAY_WATCHDOG_INTERVAL_SEC = 60
+# The relay watchdog (interval: CLINK_WATCHDOG_INTERVAL_SEC) defends the
+# listener against three silent failure modes:
+#   * Manager.connect() drops relays it could not reach and never retries them
+#     on its own -> ensure_listener_relays re-attaches missing relays.
+#   * A connection aiohttp already knows is dead (heartbeat missed a pong, the
+#     receive loop crashed) stays in manager.relays looking healthy
+#     -> prune_dead_relays drops it so the re-attach picks it up.
+#   * A half-open TCP connection (NAT/proxy idle cull) looks alive to every
+#     state check while delivering nothing -> ping_listener round-trips a
+#     self-addressed event through each relay (every
+#     CLINK_LISTENER_PING_INTERVAL_SEC) and reconnects the ones that go quiet.
+# How long ping_listener waits for its self-addressed events to echo back.
+LISTENER_PING_TIMEOUT_SEC = 30
+# Budget for publishing one ping to one relay (bounds Relay.send's internal
+# reconnect loop, which can otherwise sleep for many minutes).
+LISTENER_PING_SEND_TIMEOUT_SEC = 10
 
 
 class ClinkServer(Logger, EventListener):
@@ -112,6 +124,9 @@ class ClinkServer(Logger, EventListener):
         self.taskgroup: Optional[OldTaskGroup] = None
         self.ssl_context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH, cafile=ca_path)
         self._seen_events: "OrderedDict[str, None]" = OrderedDict()
+        # In-flight listener self-pings: ping event id -> set when it echoes
+        # back through the live subscription (see ping_listener).
+        self._pending_pings: Dict[str, asyncio.Event] = {}
         # Recent handled requests, newest last — surfaced in the Qt tab.
         self.recent_activity: "deque[Dict[str, Any]]" = deque(maxlen=50)
 
@@ -202,6 +217,20 @@ class ClinkServer(Logger, EventListener):
     @property
     def invoice_expiry_sec(self) -> int:
         return int(self.config.CLINK_INVOICE_EXPIRY)  # type: ignore[attr-defined]
+
+    @property
+    def ws_heartbeat_sec(self) -> float:
+        """Websocket ping interval for listener relay connections (0 disables)."""
+        return max(0.0, float(self.config.CLINK_WS_HEARTBEAT_SEC))  # type: ignore[attr-defined]
+
+    @property
+    def watchdog_interval_sec(self) -> int:
+        return max(1, int(self.config.CLINK_WATCHDOG_INTERVAL_SEC))  # type: ignore[attr-defined]
+
+    @property
+    def listener_ping_interval_sec(self) -> int:
+        """Cadence of the end-to-end listener self-ping (0 disables)."""
+        return max(0, int(self.config.CLINK_LISTENER_PING_INTERVAL_SEC))  # type: ignore[attr-defined]
 
     def offer_relay(self, offer: Optional[Offer]) -> str:
         """The relay ``offer``'s noffer advertises (its pinned relay, or the
@@ -437,12 +466,16 @@ class ClinkServer(Logger, EventListener):
         factory = self._proxy_factory()
         relays = self.listen_relay_urls()
         self._manager_relays = set(relays)
-        return aionostr.Manager(
+        # HeartbeatManager (not the plain aionostr.Manager): its websockets
+        # ping the relay and fail fast on a missed pong, so a silently dead
+        # connection surfaces instead of leaving the listener deaf forever.
+        return HeartbeatManager(
             relays=relays,
             private_key=self.private_key.hex(),
             log=nostr_logger,
             ssl_context=self.ssl_context,
             proxy=factory() if factory else None,
+            heartbeat_sec=self.ws_heartbeat_sec,
         )
 
     def listener_prerequisites_met(self) -> bool:
@@ -561,22 +594,154 @@ class ClinkServer(Logger, EventListener):
         # retried on the next watchdog tick.
         await manager.update_relays(sorted(desired))
 
-    async def _relay_watchdog(self) -> None:
-        while True:
-            await asyncio.sleep(RELAY_WATCHDOG_INTERVAL_SEC)
+    @staticmethod
+    def _relay_connection_dead(relay: Any) -> bool:
+        """Whether ``relay``'s connection is observably broken.
+
+        Catches states the membership check can't: a websocket aiohttp already
+        closed (e.g. the heartbeat missed a pong, or the peer reset us while
+        the library's own reconnect is stuck in its multi-minute backoff) or a
+        crashed/finished receive loop. A half-open connection still looks
+        healthy here — that is what :meth:`ping_listener` exists for.
+        """
+        if not relay.connected:
+            return True
+        if relay.ws is None or relay.ws.closed:
+            return True
+        task = relay.receive_task
+        return task is not None and task.done()
+
+    async def prune_dead_relays(self) -> None:
+        """Drop relays with observably dead connections from the manager, so
+        the watchdog's membership pass (:meth:`ensure_listener_relays`)
+        re-attaches them with fresh connections and re-issued subscriptions."""
+        manager = self.manager
+        if manager is None or not manager.connected:
+            return
+        dead = [r for r in manager.relays if self._relay_connection_dead(r)]
+        if not dead:
+            return
+        self.logger.info(
+            "dropping dead relay connection(s): "
+            + ", ".join(r.url for r in dead))
+        await self._drop_relays(dead)
+
+    async def _drop_relays(self, relays: List[Any]) -> None:
+        """Close ``relays`` and remove them from the live manager.
+
+        The next :meth:`ensure_listener_relays` sees them missing and brings
+        up fresh connections (with re-issued subscriptions) in their place — a
+        targeted teardown of connections that are already broken, leaving the
+        healthy relays' service untouched.
+        """
+        manager = self.manager
+        if manager is None:
+            return
+        for relay in relays:
             try:
+                # Bounded: ws.close on a half-open connection waits ~10s for a
+                # close frame that will never come.
+                await asyncio.wait_for(relay.close(), timeout=15)
+            except Exception:
+                self.logger.debug(f"error closing relay {relay.url}", exc_info=True)
+        manager.relays = [r for r in manager.relays if r not in relays]
+
+    def _make_listener_ping(self) -> nEvent:
+        """A self-addressed kind-21001 event used to prove a relay round-trip.
+
+        Kind 21001 is ephemeral (relays broadcast but never store it) and the
+        ``p`` tag is our own pubkey, so it reaches exactly our own listener
+        subscription and nobody else's. The nonce makes each ping's event id
+        unique even within one second, letting one ping identify one relay.
+        """
+        event = nEvent(
+            pubkey=self.pubkey_hex,
+            kind=CLINK_EVENT_KIND,
+            tags=[["p", self.pubkey_hex]],
+            content=json.dumps({"clink_listener_ping": secrets.token_hex(8)}),
+        )
+        return event.sign(self.private_key.hex())
+
+    async def ping_listener(self, *, timeout: float = LISTENER_PING_TIMEOUT_SEC) -> bool:
+        """Verify the listener actually hears each relay it sits on.
+
+        Publishes one self-addressed ping per connected relay and waits for
+        every ping to come back through the live subscription. A relay whose
+        ping does not echo within ``timeout`` has a dead receive path — the
+        deaf-listener state a half-open TCP connection causes, which no
+        connection-state check can see — so it is dropped and immediately
+        re-attached (fresh connection + re-issued subscription). Returns
+        whether every relay passed.
+        """
+        manager = self.manager
+        if manager is None or not manager.connected or not manager.relays:
+            return True  # nothing to verify; (re)connecting is run()'s job
+        waiters: Dict[str, asyncio.Event] = {}  # ping event id -> arrival flag
+        pinged: Dict[str, Any] = {}             # ping event id -> relay
+        for relay in list(manager.relays):
+            ping = self._make_listener_ping()
+            waiter = asyncio.Event()
+            self._pending_pings[ping.id] = waiter
+            waiters[ping.id] = waiter
+            pinged[ping.id] = relay
+            try:
+                await asyncio.wait_for(
+                    relay.add_event(ping.to_json_object()),
+                    timeout=LISTENER_PING_SEND_TIMEOUT_SEC)
+            except Exception as e:
+                # A failed send is handled the same as a missing echo below.
+                self.logger.info(f"listener ping send failed on {relay.url}: {e!r}")
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(w.wait() for w in waiters.values())),
+                timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            for ping_id in waiters:
+                self._pending_pings.pop(ping_id, None)
+        failed = [pinged[pid] for pid, w in waiters.items() if not w.is_set()]
+        if not failed:
+            self.logger.debug("listener self-ping ok on all relays")
+            return True
+        urls = ", ".join(r.url for r in failed)
+        self.logger.warning(
+            f"listener self-ping got no echo from {urls}; "
+            f"dropping and re-attaching the connection(s)")
+        self._record("listener", None, f"relay went silent, reconnecting: {urls[:64]}")
+        await self._drop_relays(failed)
+        await self.ensure_listener_relays()
+        return False
+
+    async def _relay_watchdog(self) -> None:
+        next_ping = time.monotonic() + self.listener_ping_interval_sec
+        while True:
+            await asyncio.sleep(self.watchdog_interval_sec)
+            try:
+                await self.prune_dead_relays()
                 await self.ensure_listener_relays()
             except Exception:
                 self.logger.exception("error reconnecting listener relays")
+            ping_interval = self.listener_ping_interval_sec
+            if ping_interval and time.monotonic() >= next_ping:
+                next_ping = time.monotonic() + ping_interval
+                try:
+                    await self.ping_listener()
+                except Exception:
+                    self.logger.exception("error self-pinging the listener")
 
     # --- request handling ------------------------------------------------
 
     async def handle_requests(self) -> None:
+        # ``since`` reaches back one freshness window (no ``limit: 0``), so a
+        # relay that buffers recent events replays requests published during a
+        # listener restart/reconnect gap instead of losing them. Redelivery is
+        # safe: _dispatch clamps freshness to MAX_REQUEST_AGE_SEC and the
+        # seen-events guard drops anything already answered this session.
         query = {
             "kinds": [CLINK_EVENT_KIND],
             "#p": [self.pubkey_hex],
-            "since": int(time.time()),
-            "limit": 0,
+            "since": int(time.time()) - MAX_REQUEST_AGE_SEC,
         }
         self.logger.info(f"listening for offers on {', '.join(self.listen_relay_urls())} as {self.pubkey_hex}")
         async for event in self.manager.get_events(query, single_event=False, only_stored=False):
@@ -584,6 +749,12 @@ class ClinkServer(Logger, EventListener):
                 await self._dispatch(event)
             except Exception:
                 self.logger.exception("error handling clink request")
+        # A live (only_stored=False) subscription must never end on its own —
+        # if it does (e.g. a poisoned end-of-stream sentinel from the relay
+        # layer), returning here would leave run()'s taskgroup humming along
+        # with no listener: offers silently unpayable for the rest of the
+        # session. Raise instead so run() tears the manager down and rebuilds.
+        raise RuntimeError("listener event stream ended unexpectedly")
 
     def _already_seen(self, event_id: str) -> bool:
         if event_id in self._seen_events:
@@ -594,6 +765,12 @@ class ClinkServer(Logger, EventListener):
         return False
 
     async def _dispatch(self, event: nEvent) -> None:
+        # Listener self-pings (watchdog liveness probes addressed to ourselves)
+        # are consumed here — their arrival IS the signal (see ping_listener).
+        ping_waiter = self._pending_pings.pop(event.id, None)
+        if ping_waiter is not None:
+            ping_waiter.set()
+            return
         if event.kind != CLINK_EVENT_KIND:
             return
         # Skip our own responses (kind is shared by request and response).
