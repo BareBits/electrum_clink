@@ -96,6 +96,19 @@ An *optional* .1% dev fee is included by default, which can be disabled in the s
   "relay refused" failure — with the relay's reason — in the noffer self-test
   and the log, instead of masquerading as a generic "no response". See
   `publish.py` and the lifecycle handling in `clink_plugin.py`.
+* **Silent-death detection.** A NAT box, reverse proxy, or dying relay host can
+  cull the idle relay websocket without ever sending a close — the connection
+  looks healthy while delivering nothing, and the listener used to go deaf
+  after long uptimes until the wallet was restarted. Three layered defenses
+  (see `nostr_transport.py` and the watchdog in `clink_plugin.py`): every
+  listener websocket carries a client-side ping/pong **heartbeat** (30 s; a
+  missed pong tears the connection down), the watchdog **prunes** connections
+  aiohttp already knows are dead so they get re-attached with a fresh socket
+  and re-issued subscription, and every 5 minutes the plugin **self-pings**:
+  it publishes a self-addressed (ephemeral, kind-21001) event per relay and
+  verifies each echoes back through the live subscription — the only check
+  that also catches a half-open connection — reconnecting any relay that stays
+  silent. Recovery is per-relay: healthy relays keep serving throughout.
 * **Debits / management** (`ndebit` / `nmanage`) are **not** implemented yet;
   they are stubbed via the protocol's "unsupported feature" path so they can be
   added without restructuring.
@@ -167,6 +180,9 @@ dependencies**.
 |---|---|---|
 | `plugins.clink.relay` | `""` (auto-picks a working relay from `NOSTR_RELAYS`) | relay encoded in noffers + subscribed to |
 | `plugins.clink.invoice_expiry_sec` | `300` | invoice lifetime **and** liquidity-lock window |
+| `plugins.clink.ws_heartbeat_sec` | `30` | listener websocket ping interval; a missed pong drops the connection (0 disables) |
+| `plugins.clink.watchdog_interval_sec` | `60` | how often the watchdog checks/re-attaches listener relay connections |
+| `plugins.clink.listener_ping_interval_sec` | `300` | how often the listener round-trips a self-addressed event per relay to prove it can still hear (0 disables) |
 | `plugins.clink.devfee_enabled` | `true` | collect the optional dev fee (opt-out) |
 | `plugins.clink.devfee_rate_percent` | `0.1` | dev-fee rate, % of each inbound payment (0.001–5) |
 | `plugins.clink.devfee_dest` | `clink_fees@getbarebits.com` | Lightning address / LNURL / URL the fee is forwarded to |

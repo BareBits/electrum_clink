@@ -22,9 +22,10 @@ import os
 import signal
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Optional
 
 import pytest
 
@@ -571,6 +572,162 @@ def test_devfee_accrues_and_pays_out(rig) -> None:
     # The payout was within the 10,000 sat/day cap and debited the owed balance.
     assert status["paid_last_24h_sat"] <= 10_000, status
     assert status["owed_sat"] < owed_before + expected_fee, status
+
+
+class _BlackholeProxy:
+    """A TCP forwarder in front of a relay that can 'go dark' on command.
+
+    With ``blackhole`` set, established connections stay open (the kernel
+    keeps ACKing whatever the peer sends — websocket pings included) but all
+    payload silently vanishes, and new connections are accepted but never
+    answered. To the plugin this is byte-for-byte the field failure: a NAT
+    box / reverse proxy culling the idle connection without ever sending a
+    FIN, leaving the listener deaf on a socket that looks perfectly healthy.
+
+    Runs its own asyncio loop on a daemon thread so the synchronous test body
+    can toggle the blackhole while Electrum (in its own process) talks
+    through the proxy.
+    """
+
+    def __init__(self, backend_port: int) -> None:
+        self.backend_port = backend_port
+        self.port = _free_port()
+        self.blackhole = threading.Event()
+        self._started = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=lambda: asyncio.run(self._main()),
+                                        daemon=True)
+        self._thread.start()
+        assert self._started.wait(timeout=10), "proxy did not start"
+
+    async def _main(self) -> None:
+        server = await asyncio.start_server(self._handle, "127.0.0.1", self.port)
+        self._started.set()
+        async with server:
+            await server.serve_forever()  # daemon thread; dies with the test run
+
+    async def _handle(self, creader: asyncio.StreamReader,
+                      cwriter: asyncio.StreamWriter) -> None:
+        if self.blackhole.is_set():
+            # Accept but never answer: the websocket handshake stalls until
+            # the client's own connect timeout fires.
+            try:
+                while await creader.read(65536):
+                    pass
+            except Exception:
+                pass
+            finally:
+                cwriter.close()
+            return
+        try:
+            breader, bwriter = await asyncio.open_connection(
+                "127.0.0.1", self.backend_port)
+        except Exception:
+            cwriter.close()
+            return
+
+        async def pump(reader: asyncio.StreamReader,
+                       writer: asyncio.StreamWriter) -> None:
+            try:
+                while True:
+                    data = await reader.read(65536)
+                    if not data:
+                        break
+                    if self.blackhole.is_set():
+                        continue  # swallow: the connection lives, data vanishes
+                    writer.write(data)
+                    await writer.drain()
+            except Exception:
+                pass
+            finally:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+        await asyncio.gather(pump(creader, bwriter), pump(breader, cwriter),
+                             return_exceptions=True)
+
+
+_ROBUSTNESS_KEYS = ("ws_heartbeat_sec", "watchdog_interval_sec",
+                    "listener_ping_interval_sec")
+
+
+def test_listener_recovers_after_relay_path_goes_silent(rig) -> None:
+    """THE long-uptime deafness regression, end to end.
+
+    An offer is pinned to a relay behind a TCP proxy; the proxy then goes
+    dark while keeping every socket open — the half-open state after which
+    (before the heartbeat + watchdog prune + self-ping fixes) the listener
+    stayed deaf forever and only a wallet restart helped. With the fixes the
+    plugin must notice on its own and be answering again shortly after the
+    path comes back, with no restart and no user action.
+    """
+    backend_url, backend_proc = _start_extra_relay()
+    backend_port = int(backend_url.rsplit(":", 1)[1])
+    proxy = _BlackholeProxy(backend_port)
+    proxy.start()
+    fast = {"ws_heartbeat_sec": "5", "watchdog_interval_sec": "5",
+            "listener_ping_interval_sec": "15"}
+    defaults = {"ws_heartbeat_sec": "30", "watchdog_interval_sec": "60",
+                "listener_ping_interval_sec": "300"}
+    created: Dict[str, Any] = {}
+    try:
+        for key in _ROBUSTNESS_KEYS:
+            _electrum_cli("setconfig", f"plugins.clink.{key}", fast[key])
+        # Creating the offer restarts the listener, so the shrunk intervals
+        # (and the heartbeat) apply to the rebuilt relay manager.
+        created = json.loads(_electrum_cli(
+            "clink_add_offer", "--label", "deaf-e2e",
+            "--relay", f"ws://127.0.0.1:{proxy.port}"))
+        assert created["relay_payable"] is True, created
+
+        _wait_available_sat(1)
+        deadline = time.monotonic() + 60
+        result: Dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            result = json.loads(_electrum_cli(
+                "clink_check_noffers", "--offer_id",
+                created["offer_id"]))[created["offer_id"]]
+            if result["ok"]:
+                break
+            time.sleep(3)
+        assert result.get("ok") is True, f"offer never payable via proxy: {result}"
+
+        proxy.blackhole.set()
+        # Long enough for the ~5s heartbeat to miss a pong and tear the
+        # websocket down, the 5s watchdog to prune it, and at least one
+        # re-attach attempt to fail against the dark proxy — i.e. the plugin
+        # must recover from a connection it *detected* as dead, not ride out
+        # one that was never really gone.
+        time.sleep(30)
+        proxy.blackhole.clear()
+
+        deadline = time.monotonic() + 120
+        result = {}
+        while time.monotonic() < deadline:
+            result = json.loads(_electrum_cli(
+                "clink_check_noffers", "--offer_id",
+                created["offer_id"]))[created["offer_id"]]
+            if result["ok"]:
+                break
+            time.sleep(3)
+        assert result.get("ok") is True, \
+            f"listener never recovered after the silent-death window: {result}"
+
+        # And a real payer gets an invoice again through the recovered path.
+        resp = asyncio.run(request_invoice(created["noffer"], amount_sats=1, timeout=30))
+        assert "bolt11" in resp, resp
+    finally:
+        for key in _ROBUSTNESS_KEYS:
+            _electrum_cli("setconfig", f"plugins.clink.{key}", defaults[key])
+        if created:
+            # Later tests sweep advertised relays; don't leave one pinned to
+            # a proxy that dies with this test.
+            _electrum_cli("clink_remove_offer", created["offer_id"])
+        _stop_relay(backend_proc)
 
 
 def test_wallet_reload_keeps_offers_payable(rig) -> None:

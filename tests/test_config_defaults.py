@@ -23,6 +23,18 @@ def test_invoice_expiry_default_is_300s() -> None:
     assert var.key() == "plugins.clink.invoice_expiry_sec"
 
 
+def test_listener_robustness_defaults() -> None:
+    """The silent-listener defense knobs ship with production cadences; the
+    rig/e2e tests shrink them explicitly when they need fast recovery."""
+    assert SimpleConfig.CLINK_WS_HEARTBEAT_SEC.get_default_value() == 30
+    assert SimpleConfig.CLINK_WS_HEARTBEAT_SEC.key() == "plugins.clink.ws_heartbeat_sec"
+    assert SimpleConfig.CLINK_WATCHDOG_INTERVAL_SEC.get_default_value() == 60
+    assert SimpleConfig.CLINK_WATCHDOG_INTERVAL_SEC.key() == "plugins.clink.watchdog_interval_sec"
+    assert SimpleConfig.CLINK_LISTENER_PING_INTERVAL_SEC.get_default_value() == 300
+    assert (SimpleConfig.CLINK_LISTENER_PING_INTERVAL_SEC.key()
+            == "plugins.clink.listener_ping_interval_sec")
+
+
 def test_devfee_defaults_unchanged() -> None:
     """Companion pin: the dev-fee defaults the README documents."""
     assert SimpleConfig.CLINK_DEVFEE_ENABLED.get_default_value() is True

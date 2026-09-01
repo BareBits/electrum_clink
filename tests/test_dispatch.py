@@ -56,6 +56,7 @@ def _dispatch_server() -> Tuple[Any, Dict[str, List[Any]]]:
     server.private_key = server_sk
     server.pubkey_hex = server_sk.public_key.hex()
     server._seen_events = OrderedDict()
+    server._pending_pings = {}
     server.recent_activity = deque(maxlen=50)
     server._selftest_payers = {}
     offer = Offer(offer_id="o1", label="L")

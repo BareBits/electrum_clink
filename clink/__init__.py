@@ -74,6 +74,42 @@ SimpleConfig.CLINK_INVOICE_EXPIRY = ConfigVar(
     plugin=plugin_name,
 )
 
+# --- Listener robustness -------------------------------------------------
+# Three knobs behind the silent-listener defenses (a NAT box or reverse proxy
+# culling the idle relay websocket used to leave the listener deaf until a
+# wallet restart). Defaults are production values; the regtest rig / e2e tests
+# shrink them to keep recovery tests fast.
+
+# Client-side websocket ping interval for the listener's relay connections.
+# A missed pong tears the connection down, so a silently dead relay path is
+# detected instead of blocking the receive loop forever. 0 disables (not
+# recommended outside debugging).
+SimpleConfig.CLINK_WS_HEARTBEAT_SEC = ConfigVar(
+    key="plugins.clink.ws_heartbeat_sec",
+    default=30,
+    type_=int,
+    plugin=plugin_name,
+)
+
+# How often the relay watchdog checks the listener's relay connections
+# (membership drift, observably dead connections).
+SimpleConfig.CLINK_WATCHDOG_INTERVAL_SEC = ConfigVar(
+    key="plugins.clink.watchdog_interval_sec",
+    default=60,
+    type_=int,
+    plugin=plugin_name,
+)
+
+# How often the watchdog round-trips a self-addressed event through every
+# listened relay to prove the subscription is alive end to end (catches the
+# half-open connections no connection-state check can see). 0 disables.
+SimpleConfig.CLINK_LISTENER_PING_INTERVAL_SEC = ConfigVar(
+    key="plugins.clink.listener_ping_interval_sec",
+    default=300,
+    type_=int,
+    plugin=plugin_name,
+)
+
 # --- Dev fee -------------------------------------------------------------
 # An optional, opt-out contribution that funds further plugin development. It
 # accrues as a small fraction of inbound payments answered through CLINK offers
