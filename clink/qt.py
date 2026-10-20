@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import math
 from datetime import datetime
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QPixmap, QImage
@@ -103,43 +103,47 @@ if TYPE_CHECKING:
 class Plugin(ClinkPlugin):
     def __init__(self, *args):
         ClinkPlugin.__init__(self, *args)
-        self._tab: Optional["ClinkTab"] = None
+        # One CLINK tab per wallet window. The tab exists for every lightning
+        # wallet — even a not-yet-enabled one, so it can host the opt-in
+        # toggle; the wallet's server only runs while CLINK is enabled on it.
+        self._tabs: Dict["ElectrumWindow", "ClinkTab"] = {}
 
     @hook
     def load_wallet(self, wallet: "Abstract_Wallet", window: "ElectrumWindow"):
         if not wallet.has_lightning():
             return
-        self.start_plugin(wallet)
-        if self._tab is None and self.server is not None:
-            self._tab = ClinkTab(self, window)
-            window.tabs.addTab(self._tab, read_QIcon("tab_send.png"), _("CLINK"))
+        self.start_plugin(wallet)  # no-op unless the wallet has CLINK enabled
+        if window not in self._tabs:
+            tab = ClinkTab(self, window)
+            self._tabs[window] = tab
+            window.tabs.addTab(tab, read_QIcon("tab_send.png"), _("CLINK"))
 
-    def _remove_tab(self) -> None:
-        if self._tab is None:
+    def _remove_tab(self, window: "ElectrumWindow") -> None:
+        tab = self._tabs.pop(window, None)
+        if tab is None:
             return
         try:
-            window = self._tab.window
-            idx = window.tabs.indexOf(self._tab)
+            idx = window.tabs.indexOf(tab)
             if idx >= 0:
                 window.tabs.removeTab(idx)
         except Exception:
             pass
-        self._tab = None
 
     @hook
     def close_wallet(self, wallet: Optional["Abstract_Wallet"] = None, *args, **kwargs):
-        # Drop the tab only when the wallet of the window hosting it closes;
-        # a close of some *other* wallet must leave both the tab and (via the
-        # base hook's own wallet check) the running server untouched.
-        if self._tab is not None and (
-                wallet is None or getattr(self._tab.window, "wallet", None) is wallet):
-            self._remove_tab()
+        # Drop only the tab of the window whose wallet closes; a close of some
+        # *other* wallet must leave the remaining tabs and (via the base hook's
+        # per-wallet matching) the other running servers untouched.
+        for window in list(self._tabs):
+            if wallet is None or getattr(window, "wallet", None) is wallet:
+                self._remove_tab(window)
         ClinkPlugin.close_wallet(self, wallet, *args, **kwargs)
 
     def on_close(self) -> None:
-        # Plugin disabled from the Plugins dialog: drop the tab along with
-        # the server (the base on_close stops the listener).
-        self._remove_tab()
+        # Plugin disabled from the Plugins dialog: drop every tab along with
+        # the servers (the base on_close stops the listeners).
+        for window in list(self._tabs):
+            self._remove_tab(window)
         ClinkPlugin.on_close(self)
 
 
@@ -148,6 +152,10 @@ class ClinkTab(QWidget):
         QWidget.__init__(self)
         self.plugin = plugin
         self.window = window
+        self.wallet: "Abstract_Wallet" = window.wallet
+        # This wallet's own settings (each knob falls back to the global
+        # plugins.clink.* config until the wallet overrides it).
+        self.settings = plugin.wallet_settings(self.wallet)
         # Guards itemChanged while we repopulate the table, and one-shot window grow.
         self._populating = False
         self._grown = False
@@ -164,11 +172,27 @@ class ClinkTab(QWidget):
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
-        root = QVBoxLayout(content)
+        top = QVBoxLayout(content)
 
         header = QLabel("<b>" + _("CLINK Offers") + "</b> — "
                         + _("generate noffers and answer requests with Lightning invoices"))
-        root.addWidget(header)
+        top.addWidget(header)
+
+        # CLINK is opt-in per wallet: the toggle starts/stops this wallet's
+        # listener; everything below it is greyed out while disabled.
+        self.enable_cb = QCheckBox(_("Enable CLINK on this wallet"))
+        self.enable_cb.setToolTip(_(
+            "Runs the CLINK service for this wallet: it keeps a Nostr relay "
+            "connection open and answers offer requests with invoices. Stored "
+            "in the wallet, so it stays enabled across restarts."))
+        self.enable_cb.setChecked(self.settings.enabled)
+        self.enable_cb.toggled.connect(self._on_enable_toggled)
+        top.addWidget(self.enable_cb)
+
+        self._body = QWidget()
+        top.addWidget(self._body)
+        root = QVBoxLayout(self._body)
+        root.setContentsMargins(0, 0, 0, 0)
 
         self.identity_label = QLabel()
         self.identity_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -182,7 +206,7 @@ class ClinkTab(QWidget):
         status_row.addWidget(QLabel(_("Invoice expiry / liquidity lock (s):")))
         self.expiry_spin = QSpinBox()
         self.expiry_spin.setRange(10, 86400)
-        self.expiry_spin.setValue(int(self.plugin.config.CLINK_INVOICE_EXPIRY))
+        self.expiry_spin.setValue(int(self.settings.invoice_expiry_sec))
         self.expiry_spin.valueChanged.connect(self._on_expiry_changed)
         status_row.addWidget(self.expiry_spin)
         root.addLayout(status_row)
@@ -247,6 +271,7 @@ class ClinkTab(QWidget):
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(footer)
 
+        self._sync_enabled_ui()
         self._refresh()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_dynamic)
@@ -255,7 +280,19 @@ class ClinkTab(QWidget):
         # Grow the window the first time this tab is shown (see _maybe_grow_window).
         self.window.tabs.currentChanged.connect(self._on_tab_changed)
 
-        self._maybe_show_devfee_notice()
+        if self.settings.enabled:
+            self._maybe_show_devfee_notice()
+
+    # -- per-wallet enable toggle ------------------------------------------
+    def _on_enable_toggled(self, checked: bool) -> None:
+        self.plugin.set_wallet_enabled(self.wallet, bool(checked))
+        self._sync_enabled_ui()
+        if checked:
+            self._maybe_show_devfee_notice()
+        self._refresh()
+
+    def _sync_enabled_ui(self) -> None:
+        self._body.setEnabled(self.enable_cb.isChecked())
 
     # -- window sizing ----------------------------------------------------
     def _on_tab_changed(self, index: int) -> None:
@@ -279,7 +316,7 @@ class ClinkTab(QWidget):
 
     # -- dev fee ----------------------------------------------------------
     def _build_devfee_group(self) -> QGroupBox:
-        cfg = self.plugin.config
+        cfg = self.settings
         box = QGroupBox(_("Dev fee 💜"))
         v = QVBoxLayout(box)
         v.addWidget(QLabel(
@@ -288,7 +325,7 @@ class ClinkTab(QWidget):
               "offers and forwarded once it passes 1,000 sat.")))
 
         self.devfee_enable = QCheckBox(_("Enable dev fee"))
-        self.devfee_enable.setChecked(bool(cfg.CLINK_DEVFEE_ENABLED))
+        self.devfee_enable.setChecked(cfg.devfee_enabled)
         self.devfee_enable.toggled.connect(self._on_devfee_enabled)
         v.addWidget(self.devfee_enable)
 
@@ -301,7 +338,7 @@ class ClinkTab(QWidget):
         rate_row.addWidget(self.devfee_rate_label)
         self.devfee_slider = QSlider(Qt.Orientation.Horizontal)
         self.devfee_slider.setRange(0, _DEVFEE_SLIDER_STEPS)
-        self.devfee_slider.setValue(_devfee_pct_to_slider(float(cfg.CLINK_DEVFEE_RATE_PERCENT)))
+        self.devfee_slider.setValue(_devfee_pct_to_slider(cfg.devfee_rate_percent))
         self.devfee_slider.valueChanged.connect(self._on_devfee_rate_changed)
         rate_row.addWidget(self.devfee_slider, stretch=1)
         v.addLayout(rate_row)
@@ -314,7 +351,7 @@ class ClinkTab(QWidget):
         return box
 
     def _on_devfee_enabled(self, checked: bool) -> None:
-        self.plugin.config.CLINK_DEVFEE_ENABLED = bool(checked)
+        self.settings.devfee_enabled = bool(checked)
         self._sync_devfee_enabled_state()
 
     def _sync_devfee_enabled_state(self) -> None:
@@ -322,7 +359,7 @@ class ClinkTab(QWidget):
 
     def _on_devfee_rate_changed(self, value: int) -> None:
         pct = _devfee_slider_to_pct(value)
-        self.plugin.config.CLINK_DEVFEE_RATE_PERCENT = float(pct)
+        self.settings.devfee_rate_percent = float(pct)
         self._sync_devfee_rate_label()
 
     def _sync_devfee_rate_label(self) -> None:
@@ -330,10 +367,11 @@ class ClinkTab(QWidget):
         self.devfee_rate_label.setText(_fmt_pct(pct))
 
     def _maybe_show_devfee_notice(self) -> None:
-        cfg = self.plugin.config
-        if cfg.CLINK_DEVFEE_NOTICE_SHOWN:
+        # Per wallet, but falls back to the global flag: an install that saw
+        # the notice before settings became per-wallet is not nagged again.
+        if self.settings.devfee_notice_shown:
             return
-        cfg.CLINK_DEVFEE_NOTICE_SHOWN = True
+        self.settings.devfee_notice_shown = True
         QMessageBox.information(self, _(DEVFEE_NOTICE_TITLE), _(DEVFEE_NOTICE_TEXT))
 
     # -- helpers ----------------------------------------------------------
@@ -351,7 +389,7 @@ class ClinkTab(QWidget):
             btn.setEnabled(has_sel)
 
     def _on_expiry_changed(self, value: int) -> None:
-        self.plugin.config.CLINK_INVOICE_EXPIRY = int(value)
+        self.settings.invoice_expiry_sec = int(value)
 
     def _on_new_offer(self) -> None:
         result = self._prompt_offer_details()
@@ -367,7 +405,8 @@ class ClinkTab(QWidget):
         try:
             self.window.run_coroutine_dialog(
                 self.plugin.create_offer(
-                    label=label, allow_payer_memo=allow_memo, relay=relay),
+                    self.wallet, label=label, allow_payer_memo=allow_memo,
+                    relay=relay),
                 message,
             )
         except UserCancelled:
@@ -401,7 +440,7 @@ class ClinkTab(QWidget):
         relay_combo.setEditable(True)
         relay_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         relay_combo.addItem(RELAY_AUTO_LABEL)
-        for url in self.plugin.candidate_relay_urls():
+        for url in self.plugin.candidate_relay_urls(self.wallet):
             relay_combo.addItem(url)
         relay_combo.setToolTip(_(
             "The Nostr relay this offer's noffer advertises, pinned to the "
@@ -431,7 +470,7 @@ class ClinkTab(QWidget):
         offer_id = self._selected_offer_id()
         if offer_id is None:
             return
-        self.plugin.remove_offer(offer_id)
+        self.plugin.remove_offer(self.wallet, offer_id)
         self._refresh()
 
     # -- inline edits (label rename + payer-memo toggle) ------------------
@@ -447,10 +486,10 @@ class ClinkTab(QWidget):
         if not offer_id:
             return
         if column == COL_LABEL:
-            self.plugin.set_offer_label(offer_id, item.text(COL_LABEL).strip())
+            self.plugin.set_offer_label(self.wallet, offer_id, item.text(COL_LABEL).strip())
         elif column == COL_MEMO:
             allow = item.checkState(COL_MEMO) == Qt.CheckState.Checked
-            self.plugin.set_offer_allow_payer_memo(offer_id, allow)
+            self.plugin.set_offer_allow_payer_memo(self.wallet, offer_id, allow)
 
     def _on_copy(self) -> None:
         noffer = self._selected_noffer()
@@ -460,17 +499,17 @@ class ClinkTab(QWidget):
 
     # -- noffer self-test --------------------------------------------------
     def _on_check_noffers(self) -> None:
-        if not self.plugin.list_offers():
+        if not self.plugin.list_offers(self.wallet):
             self.window.show_message(_("No offers to check yet."))
             return
-        if self.plugin.noffer_check_running():
+        if self.plugin.noffer_check_running(self.wallet):
             return  # button is disabled while a run is live; belt and braces
         # Fire the check on the asyncio loop; the 2s poller renders "Checking…"
         # rows and the results as they land, and re-enables the button. Errors
         # are logged rather than raised into Qt (per-offer failures are already
         # folded into each offer's result).
         future = asyncio.run_coroutine_threadsafe(
-            self.plugin.check_noffers(), get_asyncio_loop())
+            self.plugin.check_noffers(self.wallet), get_asyncio_loop())
         future.add_done_callback(self._on_check_done)
         self._refresh_dynamic()
 
@@ -483,7 +522,7 @@ class ClinkTab(QWidget):
 
     def _status_cell(self, result: Optional[CheckResult]) -> Tuple[str, str]:
         """Render one offer's self-test result as (cell text, tooltip)."""
-        if self.plugin.noffer_check_running():
+        if self.plugin.noffer_check_running(self.wallet):
             return _("Checking…"), _("A noffer check is in progress.")
         if result is None:
             return "—", _("Not checked yet. Press \"Check noffers\".")
@@ -531,10 +570,11 @@ class ClinkTab(QWidget):
         return text, tooltip
 
     def _refresh_check_column(self) -> None:
-        results = self.plugin.noffer_check_results()
+        results = self.plugin.noffer_check_results(self.wallet)
         self.check_btn.setText(
-            _("Checking…") if self.plugin.noffer_check_running() else _("Check noffers"))
-        self.check_btn.setEnabled(not self.plugin.noffer_check_running())
+            _("Checking…") if self.plugin.noffer_check_running(self.wallet)
+            else _("Check noffers"))
+        self.check_btn.setEnabled(not self.plugin.noffer_check_running(self.wallet))
         for i in range(self.offers_list.topLevelItemCount()):
             item = self.offers_list.topLevelItem(i)
             offer_id = item.data(COL_LABEL, OFFER_ID_ROLE)
@@ -549,7 +589,7 @@ class ClinkTab(QWidget):
         A banner lists every down relay; affected offer rows get a ⚠ marker on
         the relay column. Both clear on their own once a relay recovers.
         """
-        liveness = self.plugin.relay_liveness()
+        liveness = self.plugin.relay_liveness(self.wallet)
         down = {url: res for url, res in liveness.items() if not res.get("ok")}
         if down:
             parts = []
@@ -602,13 +642,13 @@ class ClinkTab(QWidget):
     # -- refresh ----------------------------------------------------------
     def _refresh(self) -> None:
         self.identity_label.setText(
-            _("Identity pubkey:") + f" {self.plugin.identity_pubkey or '—'}")
+            _("Identity pubkey:") + f" {self.plugin.identity_pubkey(self.wallet) or '—'}")
         selected = self._selected_noffer()
         # Suppress itemChanged while we rebuild rows (setText/setCheckState fire it).
         self._populating = True
         try:
             self.offers_list.clear()
-            for offer_id, info in self.plugin.list_offers().items():
+            for offer_id, info in self.plugin.list_offers(self.wallet).items():
                 item = QTreeWidgetItem(
                     [info["label"], "", offer_id, info["noffer"],
                      info.get("relay", ""), ""])
@@ -656,18 +696,18 @@ class ClinkTab(QWidget):
             self.plugin.logger.info(f"clink tab refresh skipped: {e!r}")
 
     def _do_refresh_dynamic(self) -> None:
-        status = self.plugin.liquidity_status()
+        status = self.plugin.liquidity_status(self.wallet)
         self.liquidity_label.setText(_("Inbound liquidity — available: {} sat | locked: {} sat ({} active)").format(
             status["available_sat"], status["reserved_sat"], status["active_reservations"]))
         lines = []
-        for entry in reversed(self.plugin.recent_activity()):
+        for entry in reversed(self.plugin.recent_activity(self.wallet)):
             ts = datetime.fromtimestamp(entry["time"]).strftime("%H:%M:%S")
             amt = entry["amount_sat"]
             amt_str = f"{amt} sat" if amt is not None else "—"
             lines.append(f"{ts}  offer={entry['offer'] or '?'}  {amt_str}  →  {entry['result']}")
         self.activity.setPlainText("\n".join(lines))
 
-        devfee = self.plugin.devfee_status()
+        devfee = self.plugin.devfee_status(self.wallet)
         self.devfee_owed_label.setText(_("Owed: {} sat — forwarded to {}").format(
             devfee["owed_sat"], devfee["destination"] or "—"))
 

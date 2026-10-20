@@ -37,11 +37,13 @@ JOIN_TIMEOUT_SEC = 15.0
 
 
 class FakeConfig:
+    CLINK_WALLET_DEFAULT_ENABLED = True  # opt the fake wallet in
     CLINK_RELAY = ""
     CLINK_INVOICE_EXPIRY = 120
     CLINK_DEVFEE_ENABLED = False
     CLINK_DEVFEE_RATE_PERCENT = 0.1
     CLINK_DEVFEE_DEST = ""
+    CLINK_DEVFEE_NOTICE_SHOWN = False
     CLINK_WS_HEARTBEAT_SEC = 30
     CLINK_WATCHDOG_INTERVAL_SEC = 60
     CLINK_LISTENER_PING_INTERVAL_SEC = 300
@@ -84,13 +86,12 @@ def main(fire_hook: bool) -> int:
     Logger.__init__(plugin)
     plugin.name = "clink"
     plugin.config = FakeConfig()  # type: ignore[assignment]
-    plugin.server = None
-    from electrum.util import OldTaskGroup
-    plugin.taskgroup = OldTaskGroup()
+    plugin._servers = {}
+    plugin._taskgroups = {}
 
     wallet = _wallet()
     plugin.start_plugin(wallet)
-    server = plugin.server
+    server = plugin._server_for(wallet)
     assert server is not None
 
     # Steer run() into the listening state without touching the network.

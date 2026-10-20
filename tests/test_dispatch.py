@@ -244,6 +244,8 @@ def test_invoice_failure_reply_is_generic() -> None:
     server = ClinkServer.__new__(ClinkServer)
     Logger.__init__(server)
     server.config = SimpleNamespace(CLINK_INVOICE_EXPIRY=120)
+    from clink.settings import WalletSettings
+    server.settings = WalletSettings({}, server.config)
     server.recent_activity = deque(maxlen=50)
     server.reserver = LiquidityReserver(capacity_fn=lambda: 1000, clock_fn=time.time)
 

@@ -49,6 +49,8 @@ def _gate_server(*, offers: List[Offer], nostr_relays: List[str],
         CLINK_RELAY="",
         get_nostr_relays=lambda: nostr_relays,
     )
+    from clink.settings import WalletSettings
+    server.settings = WalletSettings({}, server.config)
     server.offers = SimpleNamespace(list=lambda: offers)
     server._relay_selection = None
     server._relay_selection_at = 0.0

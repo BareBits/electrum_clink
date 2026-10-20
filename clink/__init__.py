@@ -51,9 +51,27 @@ from electrum.simple_config import SimpleConfig, ConfigVar
 
 if TYPE_CHECKING:
     from electrum.commands import Commands
+    from electrum.wallet import Abstract_Wallet
     from .clink_plugin import ClinkPlugin
 
 plugin_name = "clink"
+
+# NOTE on scoping: every knob below is a *global default*. Each wallet can
+# override each knob for itself (persisted in the wallet DB next to its
+# offers) — see clink.settings.WalletSettings and the clink_set_setting
+# command. The globals keep single-wallet setups and the regtest rig's
+# config injection working unchanged.
+
+# Whether a wallet that was never explicitly opted in/out runs the CLINK
+# service. Opt-in by default: fresh wallets stay off until the user enables
+# them (CLINK tab toggle or clink_enable). Wallets that already hold offers
+# from a pre-opt-in install are treated as enabled regardless.
+SimpleConfig.CLINK_WALLET_DEFAULT_ENABLED = ConfigVar(
+    key="plugins.clink.wallet_default_enabled",
+    default=False,
+    type_=bool,
+    plugin=plugin_name,
+)
 
 # Relay the plugin prefers when picking (and pinning) the relay for a new
 # noffer, and subscribes to. Empty -> fall back to Electrum's global
@@ -149,9 +167,14 @@ SimpleConfig.CLINK_DEVFEE_NOTICE_SHOWN = ConfigVar(
 )
 
 
-@plugin_command("", plugin_name)
+# Every command is wallet-scoped ("w"): Electrum resolves -w/--wallet (or the
+# default wallet) to a loaded wallet object and injects it, so each command
+# acts on that wallet's own CLINK server, offers and settings.
+
+@plugin_command("w", plugin_name)
 async def add_offer(self: "Commands", label: str = "", allow_payer_memo: bool = True,
-                    relay: str = "", plugin: "ClinkPlugin" = None) -> dict:
+                    relay: str = "", wallet: "Abstract_Wallet" = None,
+                    plugin: "ClinkPlugin" = None) -> dict:
     """
     Create a new spontaneous offer and return its noffer string.
 
@@ -159,53 +182,59 @@ async def add_offer(self: "Commands", label: str = "", allow_payer_memo: bool = 
     arg:bool:allow_payer_memo:whether a payer's requested memo is folded into the invoice (default true)
     arg:str:relay:custom relay URL (wss://myrelay.com:port) the noffer advertises; omit for automatic selection. Either way the relay is probed first (a failing probe blocks creation) and pinned to the offer, so its noffer never changes across restarts.
     """
-    return await plugin.create_offer(label, allow_payer_memo, relay)
+    return await plugin.create_offer(wallet, label, allow_payer_memo, relay)
 
 
-@plugin_command("", plugin_name)
-async def list_offers(self: "Commands", plugin: "ClinkPlugin" = None) -> dict:
+@plugin_command("w", plugin_name)
+async def list_offers(self: "Commands", wallet: "Abstract_Wallet" = None,
+                      plugin: "ClinkPlugin" = None) -> dict:
     """
-    List all offers with their noffer strings.
+    List the wallet's offers with their noffer strings.
     """
-    return plugin.list_offers()
+    return plugin.list_offers(wallet)
 
 
-@plugin_command("", plugin_name)
+@plugin_command("w", plugin_name)
 async def set_offer_label(self: "Commands", offer_id: str, label: str = "",
+                          wallet: "Abstract_Wallet" = None,
                           plugin: "ClinkPlugin" = None) -> str:
     """
     Set (or clear) the human label of an existing offer.
     arg:str:offer_id:offer id, see list_offers
     arg:str:label:new label (omit to clear)
     """
-    ok = plugin.set_offer_label(offer_id, label)
+    ok = plugin.set_offer_label(wallet, offer_id, label)
     return f"updated {offer_id}" if ok else f"no such offer: {offer_id}"
 
 
-@plugin_command("", plugin_name)
+@plugin_command("w", plugin_name)
 async def set_offer_payer_memo(self: "Commands", offer_id: str, allow: bool,
+                               wallet: "Abstract_Wallet" = None,
                                plugin: "ClinkPlugin" = None) -> str:
     """
     Allow or disallow folding a payer-selected memo into invoices for an offer.
     arg:str:offer_id:offer id, see list_offers
     arg:bool:allow:true to honor payer memos, false to always use the label
     """
-    ok = plugin.set_offer_allow_payer_memo(offer_id, allow)
+    ok = plugin.set_offer_allow_payer_memo(wallet, offer_id, allow)
     return f"updated {offer_id}" if ok else f"no such offer: {offer_id}"
 
 
-@plugin_command("", plugin_name)
-async def remove_offer(self: "Commands", offer_id: str, plugin: "ClinkPlugin" = None) -> str:
+@plugin_command("w", plugin_name)
+async def remove_offer(self: "Commands", offer_id: str,
+                       wallet: "Abstract_Wallet" = None,
+                       plugin: "ClinkPlugin" = None) -> str:
     """
     Remove an offer by its id.
     arg:str:offer_id:offer id, see list_offers
     """
-    ok = plugin.remove_offer(offer_id)
+    ok = plugin.remove_offer(wallet, offer_id)
     return f"removed {offer_id}" if ok else f"no such offer: {offer_id}"
 
 
-@plugin_command("", plugin_name)
+@plugin_command("w", plugin_name)
 async def check_noffers(self: "Commands", offer_id: str = "",
+                        wallet: "Abstract_Wallet" = None,
                         plugin: "ClinkPlugin" = None) -> dict:
     """
     Verify each offer's noffer is payable end to end: connect to its relay as a
@@ -213,11 +242,12 @@ async def check_noffers(self: "Commands", offer_id: str = "",
     whether a valid invoice came back. Returns {offer_id: result}.
     arg:str:offer_id:check only this offer (omit to check all)
     """
-    return await plugin.check_noffers(offer_id or None)
+    return await plugin.check_noffers(wallet, offer_id or None)
 
 
-@plugin_command("", plugin_name)
+@plugin_command("w", plugin_name)
 async def check_relays(self: "Commands", retry_delay: int = -1,
+                       wallet: "Abstract_Wallet" = None,
                        plugin: "ClinkPlugin" = None) -> dict:
     """
     Probe every relay an existing offer's noffer advertises and report whether
@@ -226,29 +256,86 @@ async def check_relays(self: "Commands", retry_delay: int = -1,
     {relay_url: result}.
     arg:int:retry_delay:seconds to wait before the confirming re-probe of a failed relay (omit for the default 60)
     """
-    return await plugin.check_relays(retry_delay if retry_delay >= 0 else None)
+    return await plugin.check_relays(wallet, retry_delay if retry_delay >= 0 else None)
 
 
-@plugin_command("", plugin_name)
-async def clink_status(self: "Commands", plugin: "ClinkPlugin" = None) -> dict:
+@plugin_command("w", plugin_name)
+async def clink_status(self: "Commands", wallet: "Abstract_Wallet" = None,
+                       plugin: "ClinkPlugin" = None) -> dict:
     """
     Show receivable/reserved inbound liquidity and active reservations.
     """
-    return plugin.liquidity_status()
+    return plugin.liquidity_status(wallet)
 
 
-@plugin_command("", plugin_name)
-async def devfee_status(self: "Commands", plugin: "ClinkPlugin" = None) -> dict:
+@plugin_command("w", plugin_name)
+async def devfee_status(self: "Commands", wallet: "Abstract_Wallet" = None,
+                        plugin: "ClinkPlugin" = None) -> dict:
     """
     Show dev-fee settings and the current accrued/owed balance.
     """
-    return plugin.devfee_status()
+    return plugin.devfee_status(wallet)
 
 
-@plugin_command("", plugin_name)
-async def devfee_pay(self: "Commands", plugin: "ClinkPlugin" = None) -> dict:
+@plugin_command("w", plugin_name)
+async def devfee_pay(self: "Commands", wallet: "Abstract_Wallet" = None,
+                     plugin: "ClinkPlugin" = None) -> dict:
     """
     Force an immediate dev-fee payout attempt, ignoring the once-per-day gate
     (the >=1000 sat threshold and 10,000 sat/day cap still apply). For testing.
     """
-    return await plugin.devfee_pay_now()
+    return await plugin.devfee_pay_now(wallet)
+
+
+@plugin_command("w", plugin_name)
+async def enable(self: "Commands", wallet: "Abstract_Wallet" = None,
+                 plugin: "ClinkPlugin" = None) -> dict:
+    """
+    Enable the CLINK service on this wallet (starts its listener). The flag is
+    stored in the wallet file, so the wallet keeps serving across restarts.
+    """
+    return plugin.set_wallet_enabled(wallet, True)
+
+
+@plugin_command("w", plugin_name)
+async def disable(self: "Commands", wallet: "Abstract_Wallet" = None,
+                  plugin: "ClinkPlugin" = None) -> dict:
+    """
+    Disable the CLINK service on this wallet (stops its listener). Offers stay
+    stored in the wallet and resume working when re-enabled.
+    """
+    return plugin.set_wallet_enabled(wallet, False)
+
+
+# Named get_settings (not "settings") so the command function does not shadow
+# the clink.settings submodule on the package.
+@plugin_command("w", plugin_name)
+async def get_settings(self: "Commands", wallet: "Abstract_Wallet" = None,
+                       plugin: "ClinkPlugin" = None) -> dict:
+    """
+    Show the wallet's effective CLINK settings. Each entry reports its value
+    and whether it comes from this wallet or the global plugins.clink.* config.
+    """
+    return plugin.wallet_settings(wallet).effective()
+
+
+@plugin_command("w", plugin_name)
+async def set_setting(self: "Commands", key: str, value: str = "",
+                      unset: bool = False, wallet: "Abstract_Wallet" = None,
+                      plugin: "ClinkPlugin" = None) -> dict:
+    """
+    Set a per-wallet CLINK setting (see clink_get_settings for the known keys), or
+    drop the wallet override with --unset so the global config applies again.
+    arg:str:key:setting name, e.g. relay, invoice_expiry_sec, devfee_enabled
+    arg:str:value:new value (parsed to the setting's type; booleans take true/false)
+    arg:bool:unset:drop the wallet-level override instead of setting one
+    """
+    ws = plugin.wallet_settings(wallet)
+    if unset:
+        ws.clear(key)
+    else:
+        ws.set(key, value)
+    # Side effects: "enabled" brings the server up/down; listener-affecting
+    # knobs (relay, heartbeat/watchdog cadences) rebuild the live listener.
+    plugin.notify_setting_changed(wallet, key)
+    return {key: {"value": ws.get(key), "source": ws.source(key)}}

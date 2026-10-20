@@ -176,8 +176,20 @@ dependencies**.
 
 ## Configuration
 
+The plugin serves **any number of open wallets at the same time** — each
+lightning wallet gets its own CLINK server, Nostr identity, offers and
+settings. Serving is **opt-in per wallet**: flip the toggle at the top of the
+wallet's CLINK tab, or run `clink_enable -w <wallet>`. (A wallet that already
+holds offers from an older single-wallet install stays enabled automatically.)
+
+Every key below is a **global default**; each wallet can override each key for
+itself with `clink_set_setting` (stored in the wallet file, next to the
+wallet's offers). `clink_get_settings` shows a wallet's effective values and
+whether each comes from the wallet or the global config.
+
 | Config key | Default | Meaning |
 |---|---|---|
+| `plugins.clink.wallet_default_enabled` | `false` | whether wallets without an explicit opt-in/out serve CLINK (the regtest rig sets `true`) |
 | `plugins.clink.relay` | `""` (auto-picks a working relay from `NOSTR_RELAYS`) | relay encoded in noffers + subscribed to |
 | `plugins.clink.invoice_expiry_sec` | `300` | invoice lifetime **and** liquidity-lock window |
 | `plugins.clink.ws_heartbeat_sec` | `30` | listener websocket ping interval; a missed pong drops the connection (0 disables) |
@@ -199,9 +211,17 @@ By using this software, you agree not to use it for any purpose which is illegal
 
 ## CLI commands
 
-When enabled, the plugin registers `clink_`-prefixed commands:
+When enabled, the plugin registers `clink_`-prefixed commands. All of them are
+wallet-scoped: add `-w <wallet_path>` to target a specific loaded wallet
+(without it, Electrum's default wallet is used):
 
 ```bash
+electrum clink_enable                       # opt this wallet in (starts its listener)
+electrum clink_disable                      # opt it out (stops its listener; offers stay stored)
+electrum clink_get_settings                 # effective per-wallet settings + where each comes from
+electrum clink_set_setting relay --value wss://myrelay.example  # per-wallet override
+electrum clink_set_setting invoice_expiry_sec --value 60
+electrum clink_set_setting relay --unset    # back to the global config
 electrum clink_add_offer --label "coffee"   # -> {offer_id, label, allow_payer_memo, noffer}
 electrum clink_add_offer --label "coffee" --allow_payer_memo false  # never fold in payer memos
 electrum clink_list_offers

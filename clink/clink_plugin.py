@@ -65,6 +65,7 @@ from .relay_probe import (
     select_payable_relay,
 )
 from .selftest import CheckResult, CheckStatus, check_noffer
+from .settings import WalletSettings
 
 if TYPE_CHECKING:
     from electrum.simple_config import SimpleConfig
@@ -136,6 +137,9 @@ class ClinkServer(Logger, EventListener):
         self.pubkey_hex: str = self.private_key.public_key.hex()
 
         storage = plugin.get_storage(wallet)
+        # Per-wallet settings: wallet-level overrides stored next to the offers,
+        # falling back to the global plugins.clink.* config for unset knobs.
+        self.settings = WalletSettings(storage, config)
         self.offers = OfferStore(storage, now_fn=time.time)
         self.reserver = LiquidityReserver(
             capacity_fn=lambda: receivable_capacity_sat(self.wallet.lnworker),
@@ -144,8 +148,8 @@ class ClinkServer(Logger, EventListener):
         self.devfee = DevFeeLedger(
             storage,
             clock_fn=time.time,
-            enabled_fn=lambda: bool(self.config.CLINK_DEVFEE_ENABLED),  # type: ignore[attr-defined]
-            rate_fn=lambda: float(self.config.CLINK_DEVFEE_RATE_PERCENT),  # type: ignore[attr-defined]
+            enabled_fn=lambda: self.settings.devfee_enabled,
+            rate_fn=lambda: self.settings.devfee_rate_percent,
         )
         # Receipts owed to payers once their invoices settle. Persisted so a
         # receipt survives relay drops / restarts between payment and delivery.
@@ -187,12 +191,13 @@ class ClinkServer(Logger, EventListener):
     def candidate_relays(self) -> List[str]:
         """Relays to consider for a noffer, in preference order.
 
-        An explicit ``CLINK_RELAY`` override wins outright (the rig injects its
+        An explicit relay override wins outright — the wallet's own ``relay``
+        setting, falling back to the global ``CLINK_RELAY`` (the rig injects its
         local relay this way); otherwise fall back to Electrum's validated global
         ``NOSTR_RELAYS`` list, which the payability probe filters down to one that
         actually works.
         """
-        explicit = (self.config.CLINK_RELAY or "").strip()  # type: ignore[attr-defined]
+        explicit = (self.settings.relay or "").strip()
         if explicit:
             return [explicit]
         return list(self.config.get_nostr_relays())
@@ -216,21 +221,21 @@ class ClinkServer(Logger, EventListener):
 
     @property
     def invoice_expiry_sec(self) -> int:
-        return int(self.config.CLINK_INVOICE_EXPIRY)  # type: ignore[attr-defined]
+        return int(self.settings.invoice_expiry_sec)
 
     @property
     def ws_heartbeat_sec(self) -> float:
         """Websocket ping interval for listener relay connections (0 disables)."""
-        return max(0.0, float(self.config.CLINK_WS_HEARTBEAT_SEC))  # type: ignore[attr-defined]
+        return max(0.0, float(self.settings.ws_heartbeat_sec))
 
     @property
     def watchdog_interval_sec(self) -> int:
-        return max(1, int(self.config.CLINK_WATCHDOG_INTERVAL_SEC))  # type: ignore[attr-defined]
+        return max(1, int(self.settings.watchdog_interval_sec))
 
     @property
     def listener_ping_interval_sec(self) -> int:
         """Cadence of the end-to-end listener self-ping (0 disables)."""
-        return max(0, int(self.config.CLINK_LISTENER_PING_INTERVAL_SEC))  # type: ignore[attr-defined]
+        return max(0, int(self.settings.listener_ping_interval_sec))
 
     def offer_relay(self, offer: Optional[Offer]) -> str:
         """The relay ``offer``'s noffer advertises (its pinned relay, or the
@@ -356,6 +361,17 @@ class ClinkServer(Logger, EventListener):
                 f"pinned relay {sel.relay} on {len(pinned)} pre-existing "
                 f"offer(s): {', '.join(pinned)}")
         return bool(pinned)
+
+    def invalidate_relay_selection(self) -> None:
+        """Drop the cached payable-relay pick.
+
+        Called when the wallet's relay setting changes: the cache may hold a
+        24h-fresh pick probed from the *old* candidate list, and
+        :meth:`pick_payable_relay` would keep serving it — new offers would
+        silently advertise the old relay instead of the configured one.
+        """
+        self._relay_selection = None
+        self._relay_selection_at = 0.0
 
     async def ensure_offer_relays_pinned(self) -> None:
         """Run a relay pick when a pre-pinning offer still lacks its relay.
@@ -1095,7 +1111,7 @@ class ClinkServer(Logger, EventListener):
 
     @property
     def devfee_dest(self) -> str:
-        return (self.config.CLINK_DEVFEE_DEST or "").strip()  # type: ignore[attr-defined]
+        return (self.settings.devfee_dest or "").strip()
 
     def _schedule_devfee_payout(self, *, force: bool = False) -> None:
         """Fire-and-forget a payout attempt on the asyncio loop."""
@@ -1196,13 +1212,18 @@ def req_offer_id(offer) -> str:
 
 
 class ClinkPlugin(BasePlugin):
-    """Electrum plugin entry point: wires the server to wallet lifecycle."""
+    """Electrum plugin entry point: wires one server per wallet to the wallet
+    lifecycle. Any number of (lightning, CLINK-enabled) wallets can be served
+    at the same time; each server owns its wallet's offers, settings, relay
+    connections and taskgroup, all keyed by the wallet's on-disk path."""
 
     def __init__(self, parent, config: "SimpleConfig", name):
         BasePlugin.__init__(self, parent, config, name)
         self.config = config
-        self.server: Optional[ClinkServer] = None
-        self.taskgroup: OldTaskGroup = OldTaskGroup()
+        # Running servers (and the plugin-side taskgroup wrapping each
+        # server's run() task), keyed by _wallet_key.
+        self._servers: Dict[str, ClinkServer] = {}
+        self._taskgroups: Dict[str, OldTaskGroup] = {}
 
     @staticmethod
     def _wallet_file(wallet: "Abstract_Wallet") -> Optional[str]:
@@ -1213,44 +1234,78 @@ class ClinkPlugin(BasePlugin):
         except Exception:
             return None
 
+    @classmethod
+    def _wallet_key(cls, wallet: "Abstract_Wallet") -> str:
+        """Stable per-wallet dict key: the wallet file path, or (for the
+        pathological in-memory wallet) an identity-based fallback."""
+        return cls._wallet_file(wallet) or f"<unnamed-wallet-{id(wallet)}>"
+
+    def wallet_settings(self, wallet: "Abstract_Wallet") -> WalletSettings:
+        """The wallet's CLINK settings — available with or without a running
+        server (the Qt tab needs them to render the enable toggle)."""
+        return WalletSettings(self.get_storage(wallet), self.config)
+
+    def servers(self) -> List[ClinkServer]:
+        """Snapshot of the running servers (one per served wallet)."""
+        return list(self._servers.values())
+
+    def _server_for(self, wallet: Optional["Abstract_Wallet"]) -> Optional[ClinkServer]:
+        """The running server driving ``wallet`` (object or same file), if any."""
+        if wallet is None:
+            return None
+        for server in self._servers.values():
+            if server.wallet is wallet:
+                return server
+        return self._servers.get(self._wallet_key(wallet))
+
+    def _require_server(self, wallet: Optional["Abstract_Wallet"]) -> ClinkServer:
+        server = self._server_for(wallet)
+        if server is None:
+            raise UserFacingException(
+                "CLINK is not running on this wallet. Enable it in the CLINK "
+                "tab or with clink_enable (the wallet also needs Lightning).")
+        return server
+
     def start_plugin(self, wallet: "Abstract_Wallet") -> None:
+        """Bring up the wallet's server — a no-op unless the wallet has
+        lightning and CLINK is enabled on it (opt-in per wallet)."""
         if not wallet.has_lightning():
             self.logger.info("wallet has no lightning; CLINK offers need it to issue invoices")
             return
-        server = self.server
+        if not self.wallet_settings(wallet).enabled:
+            self.logger.info("CLINK is not enabled on this wallet; not starting "
+                             "(enable it in the CLINK tab or with clink_enable)")
+            return
+        key = self._wallet_key(wallet)
+        server = self._servers.get(key)
         if server is not None:
             if server.wallet is wallet:
                 return  # already driving this very wallet
-            same_file = (self._wallet_file(server.wallet) is not None
-                         and self._wallet_file(server.wallet) == self._wallet_file(wallet))
-            if not same_file:
-                return  # only drive a single wallet
             # Same wallet file, new object: the wallet was closed and reopened
             # without the Qt close hook firing (daemon close_wallet/load_wallet
             # never fires it). The old server drives a dead wallet — replace it,
             # or offers would silently stop being answered until a full restart.
-            self.logger.info("driven wallet was reloaded; restarting the CLINK server")
-            self._stop_server()
-        # A fresh taskgroup per server generation: the old one was cancelled
-        # when its server stopped and must not adopt the new run loop.
-        self.taskgroup = OldTaskGroup()
-        self.server = ClinkServer(self.config, wallet, self)
-        self._run_async(self.taskgroup.spawn(self.server.run()))
-        self.logger.info("CLINK plugin started")
+            self.logger.info(f"wallet {key} was reloaded; restarting its CLINK server")
+            self._stop_server(key)
+        # A fresh taskgroup per server generation: a cancelled one must not
+        # adopt the new run loop.
+        taskgroup = OldTaskGroup()
+        server = ClinkServer(self.config, wallet, self)
+        self._servers[key] = server
+        self._taskgroups[key] = taskgroup
+        self._run_async(taskgroup.spawn(server.run()))
+        self.logger.info(f"CLINK server started for wallet {key} "
+                         f"({len(self._servers)} wallet(s) served)")
 
     def _run_async(self, coro: Any) -> None:
         """Schedule ``coro`` on Electrum's asyncio loop (patchable in tests)."""
         asyncio.run_coroutine_threadsafe(coro, get_asyncio_loop())
 
-    def _stop_server(self) -> None:
-        """Stop and detach the current server (idempotent, restartable).
-
-        Unlike the pre-0.0.7 close path this leaves the plugin restartable: a
-        later ``start_plugin`` builds a fresh server and taskgroup instead of
-        being blocked by a sticky ``initialized`` flag.
-        """
-        server, taskgroup = self.server, self.taskgroup
-        self.server = None
+    def _stop_server(self, key: str) -> None:
+        """Stop and detach one wallet's server (idempotent, restartable):
+        a later ``start_plugin`` builds a fresh server and taskgroup."""
+        server = self._servers.pop(key, None)
+        taskgroup = self._taskgroups.pop(key, None)
         if server is None:
             return
         server.do_stop = True
@@ -1264,56 +1319,117 @@ class ClinkPlugin(BasePlugin):
                 if server.manager:
                     await server.manager.close()
             finally:
-                await taskgroup.cancel_remaining()
+                if taskgroup is not None:
+                    await taskgroup.cancel_remaining()
         self._run_async(close())
+
+    def _stop_all_servers(self) -> None:
+        for key in list(self._servers):
+            self._stop_server(key)
+
+    def set_wallet_enabled(self, wallet: "Abstract_Wallet", enabled: bool) -> Dict[str, Any]:
+        """Persist the wallet's opt-in flag and bring its server up/down to
+        match. Returns a small status dict (also the clink_enable/_disable
+        command output)."""
+        self.wallet_settings(wallet).enabled = bool(enabled)
+        self.apply_wallet_enabled(wallet)
+        return {
+            "wallet": self._wallet_key(wallet),
+            "enabled": self.wallet_settings(wallet).enabled,
+            "running": self._server_for(wallet) is not None,
+        }
+
+    def apply_wallet_enabled(self, wallet: "Abstract_Wallet") -> None:
+        """Reconcile the wallet's server with its (possibly just-changed)
+        enabled flag: start it when enabled, stop it when not."""
+        if self.wallet_settings(wallet).enabled:
+            self.start_plugin(wallet)
+            return
+        for key, server in list(self._servers.items()):
+            if server.wallet is wallet or key == self._wallet_key(wallet):
+                self._stop_server(key)
+
+    # Settings whose change must rebuild the wallet's listener to take effect
+    # (the relay set and the connection-robustness cadences are baked into the
+    # relay manager when it is built).
+    LISTENER_SETTINGS = frozenset({
+        "relay", "ws_heartbeat_sec", "watchdog_interval_sec",
+        "listener_ping_interval_sec",
+    })
+
+    def notify_setting_changed(self, wallet: "Abstract_Wallet", key: str) -> None:
+        """Apply the side effects of a just-changed per-wallet setting."""
+        if key == "enabled":
+            self.apply_wallet_enabled(wallet)
+            return
+        if key in self.LISTENER_SETTINGS:
+            server = self._server_for(wallet)
+            if server is not None:
+                if key == "relay":
+                    # The cached payable-relay pick was probed from the old
+                    # candidate list; drop it or new offers keep advertising
+                    # the old relay for up to 24h.
+                    server.invalidate_relay_selection()
+                server.restart_event_handler()
 
     @hook
     def close_wallet(self, wallet: Optional["Abstract_Wallet"] = None, *args, **kwargs):
-        # Only a close of the wallet we drive stops the server: closing some
-        # *other* wallet window used to kill the listener for the rest of the
-        # session (offers kept looking fine but no request was ever answered).
-        server = self.server
-        if server is None:
+        # Only a close of a wallet we drive stops *that wallet's* server:
+        # closing some other wallet must leave the rest untouched (pre-multi-
+        # wallet, closing any window used to kill the single listener).
+        if wallet is None:
+            # Defensive: a hook caller that passes no wallet stops everything.
+            self._stop_all_servers()
             return
-        if wallet is not None and server.wallet is not wallet:
-            # A different wallet *object* can still be the same wallet file,
-            # reopened behind our back (daemon close/load cycles never fire
-            # this hook): the server then drives a dead wallet, and skipping
-            # the stop here would leave it running — unstoppably — into the
-            # process-exit teardown. Only a genuinely different wallet file
-            # leaves the server alone.
-            ours = self._wallet_file(server.wallet)
-            theirs = self._wallet_file(wallet)
-            if ours is None or theirs is None or ours != theirs:
+        for key, server in list(self._servers.items()):
+            if server.wallet is wallet:
+                self._stop_server(key)
                 return
-        self._stop_server()
+        # A different wallet *object* can still be the same wallet file,
+        # reopened behind our back (daemon close/load cycles never fire this
+        # hook): the server then drives a dead wallet, and skipping the stop
+        # would leave it running — unstoppably — into the process-exit
+        # teardown. A wallet whose path cannot be read is not proven to be
+        # ours; stay conservative and leave the servers alone.
+        theirs = self._wallet_file(wallet)
+        if theirs is None:
+            return
+        for key, server in list(self._servers.items()):
+            if self._wallet_file(server.wallet) == theirs:
+                self._stop_server(key)
+                return
 
     def on_close(self) -> None:
         """Called by BasePlugin.close() when the plugin is disabled.
 
         By then the hooks are already unregistered, so close_wallet can never
-        fire again — without this stop the listener would keep answering
-        offers while "disabled", and its run() task would hang process exit.
+        fire again — without this stop the listeners would keep answering
+        offers while "disabled", and their run() tasks would hang process exit.
         """
-        self._stop_server()
+        self._stop_all_servers()
 
     # --- API used by cmdline + Qt ----------------------------------------
+    # Every method is wallet-scoped: it acts on the server driving ``wallet``.
+    # Read-only getters tolerate a missing server (wallet not loaded, CLINK
+    # not enabled, or torn down on shutdown while the Qt poller still fires);
+    # mutating calls raise a user-facing error instead.
 
-    async def create_offer(self, label: str = "", allow_payer_memo: bool = True,
+    async def create_offer(self, wallet: "Abstract_Wallet", label: str = "",
+                           allow_payer_memo: bool = True,
                            relay: str = "") -> Dict[str, Any]:
         """Create an offer; ``relay`` (``wss://…``) pins a custom relay instead
         of the automatic pick. Either way the relay is payability-probed first
         and a failing probe *blocks* creation, and the chosen relay is pinned
         onto the offer so the noffer handed to payers never changes across
         restarts."""
-        assert self.server is not None, "wallet not loaded yet"
+        server = self._require_server(wallet)
         custom_relay = (relay or "").strip()
         if custom_relay:
             return await self._create_offer_custom_relay(
-                custom_relay, label=label, allow_payer_memo=allow_payer_memo)
+                server, custom_relay, label=label, allow_payer_memo=allow_payer_memo)
         # Probe (cached 24h) before building the noffer so its single embedded
         # relay is one a payer can actually reach — see clink.relay_probe.
-        selection = await self.server.pick_payable_relay()
+        selection = await server.pick_payable_relay()
         if not selection.ok or not selection.relay:
             tried = ", ".join(r.relay for r in selection.results) or "(none configured)"
             raise UserFacingException(
@@ -1323,25 +1439,25 @@ class ClinkPlugin(BasePlugin):
         # The listener must sit on the pinned relay too; usually it already
         # does (pick_payable_relay restarts it on a changed pick), but a relay
         # re-picked from the 24h cache may not be covered yet.
-        needs_listener = selection.relay not in self.server.listen_relay_urls()
-        offer = self.server.offers.create(
+        needs_listener = selection.relay not in server.listen_relay_urls()
+        offer = server.offers.create(
             label=label, allow_payer_memo=allow_payer_memo,
             relay=selection.relay, relay_custom=False)
         if needs_listener:
-            self.server.restart_event_handler()
+            server.restart_event_handler()
         return {
             "offer_id": offer.offer_id, "label": offer.label,
             "allow_payer_memo": offer.allow_payer_memo,
-            "noffer": self.server.make_noffer(offer.offer_id),
+            "noffer": server.make_noffer(offer.offer_id),
             "relay": offer.relay,
             "relay_payable": True,
         }
 
-    async def _create_offer_custom_relay(self, relay: str, *, label: str,
+    async def _create_offer_custom_relay(self, server: ClinkServer, relay: str, *,
+                                         label: str,
                                          allow_payer_memo: bool) -> Dict[str, Any]:
-        assert self.server is not None
         relay = normalize_relay_url(relay)  # ValueError on a malformed URL
-        probe = await self.server.probe_custom_relay(relay)
+        probe = await server.probe_custom_relay(relay)
         if not probe.ok:
             detail = f": {probe.detail}" if probe.detail else ""
             raise UserFacingException(
@@ -1349,120 +1465,127 @@ class ClinkPlugin(BasePlugin):
                 f"({probe.status.value}{detail}). The offer was not created.")
         # The listener must sit on this relay too, or requests for the offer
         # would never arrive; restart it only when the relay is actually new.
-        needs_listener = relay not in self.server.listen_relay_urls()
-        offer = self.server.offers.create(
+        needs_listener = relay not in server.listen_relay_urls()
+        offer = server.offers.create(
             label=label, allow_payer_memo=allow_payer_memo, relay=relay,
             relay_custom=True)
         if needs_listener:
-            self.server.restart_event_handler()
+            server.restart_event_handler()
         return {
             "offer_id": offer.offer_id, "label": offer.label,
             "allow_payer_memo": offer.allow_payer_memo,
-            "noffer": self.server.make_noffer(offer.offer_id),
+            "noffer": server.make_noffer(offer.offer_id),
             "relay": relay,
             "relay_payable": True,
         }
 
-    def list_offers(self) -> Dict[str, Any]:
-        # Read-only status getters tolerate a missing server (wallet not yet
-        # loaded, or torn down on shutdown while the Qt poller is still firing).
-        if self.server is None:
+    def list_offers(self, wallet: "Abstract_Wallet") -> Dict[str, Any]:
+        server = self._server_for(wallet)
+        if server is None:
             return {}
         return {o.offer_id: {"label": o.label, "active": o.active,
                              "allow_payer_memo": o.allow_payer_memo,
-                             "noffer": self.server.make_noffer(o.offer_id),
-                             "relay": self.server.offer_relay(o),
+                             "noffer": server.make_noffer(o.offer_id),
+                             "relay": server.offer_relay(o),
                              "relay_custom": o.relay_custom,
                              # False only for a pre-pinning legacy offer whose
                              # relay is still re-derived from the config order.
                              "relay_pinned": bool(o.relay.strip())}
-                for o in self.server.offers.list()}
+                for o in server.offers.list()}
 
-    def candidate_relay_urls(self) -> List[str]:
+    def candidate_relay_urls(self, wallet: "Abstract_Wallet") -> List[str]:
         """Relays offered in the Qt "New offer" relay dropdown (config order)."""
-        if self.server is None:
+        server = self._server_for(wallet)
+        if server is None:
             return []
-        return self.server.candidate_relays()
+        return server.candidate_relays()
 
-    def set_offer_label(self, offer_id: str, label: str) -> bool:
-        assert self.server is not None, "wallet not loaded yet"
-        return self.server.offers.set_label(offer_id, label)
+    def set_offer_label(self, wallet: "Abstract_Wallet", offer_id: str,
+                        label: str) -> bool:
+        return self._require_server(wallet).offers.set_label(offer_id, label)
 
-    def set_offer_allow_payer_memo(self, offer_id: str, allow: bool) -> bool:
-        assert self.server is not None, "wallet not loaded yet"
-        return self.server.offers.set_allow_payer_memo(offer_id, allow)
+    def set_offer_allow_payer_memo(self, wallet: "Abstract_Wallet",
+                                   offer_id: str, allow: bool) -> bool:
+        return self._require_server(wallet).offers.set_allow_payer_memo(offer_id, allow)
 
-    def remove_offer(self, offer_id: str) -> bool:
-        assert self.server is not None, "wallet not loaded yet"
-        before = set(self.server.listen_relay_urls())
-        removed = self.server.offers.remove(offer_id)
+    def remove_offer(self, wallet: "Abstract_Wallet", offer_id: str) -> bool:
+        server = self._require_server(wallet)
+        before = set(server.listen_relay_urls())
+        removed = server.offers.remove(offer_id)
         # Drop the listener connection to a custom relay no other offer needs.
-        if removed and set(self.server.listen_relay_urls()) != before:
-            self.server.restart_event_handler()
+        if removed and set(server.listen_relay_urls()) != before:
+            server.restart_event_handler()
         return removed
 
-    async def check_noffers(self, offer_id: Optional[str] = None) -> Dict[str, Any]:
+    async def check_noffers(self, wallet: "Abstract_Wallet",
+                            offer_id: Optional[str] = None) -> Dict[str, Any]:
         """Self-test the noffer of one offer (or all offers) end to end.
 
         Returns ``{offer_id: result_dict}`` — see :class:`clink.selftest.CheckResult`.
         """
-        assert self.server is not None, "wallet not loaded yet"
-        results = await self.server.check_offers([offer_id] if offer_id else None)
+        server = self._require_server(wallet)
+        results = await server.check_offers([offer_id] if offer_id else None)
         return {oid: res.to_dict() for oid, res in results.items()}
 
-    def noffer_check_results(self) -> Dict[str, "CheckResult"]:
+    def noffer_check_results(self, wallet: "Abstract_Wallet") -> Dict[str, "CheckResult"]:
         """Latest session-only self-test results per offer id (may be empty)."""
-        if self.server is None:
+        server = self._server_for(wallet)
+        if server is None:
             return {}
-        return dict(self.server.check_results)
+        return dict(server.check_results)
 
-    def noffer_check_running(self) -> bool:
-        return self.server is not None and self.server.check_running
+    def noffer_check_running(self, wallet: "Abstract_Wallet") -> bool:
+        server = self._server_for(wallet)
+        return server is not None and server.check_running
 
-    def relay_liveness(self) -> Dict[str, Dict[str, Any]]:
+    def relay_liveness(self, wallet: "Abstract_Wallet") -> Dict[str, Dict[str, Any]]:
         """Latest per-relay liveness results (session-only; may be empty)."""
-        if self.server is None:
+        server = self._server_for(wallet)
+        if server is None:
             return {}
         return {relay: res.to_dict()
-                for relay, res in self.server.liveness.results.items()}
+                for relay, res in server.liveness.results.items()}
 
-    async def check_relays(self, retry_delay: Optional[float] = None) -> Dict[str, Any]:
+    async def check_relays(self, wallet: "Abstract_Wallet",
+                           retry_delay: Optional[float] = None) -> Dict[str, Any]:
         """Run the relay liveness check now (the hourly one runs on its own).
 
         ``retry_delay`` overrides the pause before a failed relay's confirming
         re-probe (mainly for tests); omit for the default.
         """
-        assert self.server is not None, "wallet not loaded yet"
-        results = await self.server.check_relay_liveness(retry_delay=retry_delay)
+        server = self._require_server(wallet)
+        results = await server.check_relay_liveness(retry_delay=retry_delay)
         return {relay: res.to_dict() for relay, res in results.items()}
 
-    def liquidity_status(self) -> Dict[str, Any]:
-        if self.server is None:
+    def liquidity_status(self, wallet: "Abstract_Wallet") -> Dict[str, Any]:
+        server = self._server_for(wallet)
+        if server is None:
             return {"available_sat": 0, "reserved_sat": 0, "active_reservations": 0,
                     "owed_receipts": 0}
         return {
-            "available_sat": self.server.reserver.available_sat(),
-            "reserved_sat": self.server.reserver.reserved_sat(),
-            "active_reservations": len(self.server.reserver.active()),
-            "owed_receipts": self.server.receipts.owed_count(),
+            "available_sat": server.reserver.available_sat(),
+            "reserved_sat": server.reserver.reserved_sat(),
+            "active_reservations": len(server.reserver.active()),
+            "owed_receipts": server.receipts.owed_count(),
         }
 
-    def recent_activity(self) -> list:
-        if self.server is None:
+    def recent_activity(self, wallet: "Abstract_Wallet") -> list:
+        server = self._server_for(wallet)
+        if server is None:
             return []
-        return list(self.server.recent_activity)
+        return list(server.recent_activity)
 
-    def devfee_status(self) -> Dict[str, Any]:
-        if self.server is None:
+    def devfee_status(self, wallet: "Abstract_Wallet") -> Dict[str, Any]:
+        server = self._server_for(wallet)
+        if server is None:
             return {"owed_sat": 0, "destination": ""}
-        status = self.server.devfee.status()
-        status["destination"] = self.server.devfee_dest
+        status = server.devfee.status()
+        status["destination"] = server.devfee_dest
         return status
 
-    async def devfee_pay_now(self) -> Dict[str, Any]:
-        assert self.server is not None, "wallet not loaded yet"
-        return await self.server.maybe_pay_devfee(force=True)
+    async def devfee_pay_now(self, wallet: "Abstract_Wallet") -> Dict[str, Any]:
+        return await self._require_server(wallet).maybe_pay_devfee(force=True)
 
-    @property
-    def identity_pubkey(self) -> Optional[str]:
-        return self.server.pubkey_hex if self.server else None
+    def identity_pubkey(self, wallet: "Abstract_Wallet") -> Optional[str]:
+        server = self._server_for(wallet)
+        return server.pubkey_hex if server else None

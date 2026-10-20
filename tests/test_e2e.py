@@ -36,6 +36,9 @@ pytestmark = pytest.mark.e2e
 RIG_DIR = Path(__file__).resolve().parents[2] / "electrum-regtest-rig"
 RIG_PYTHON = RIG_DIR / ".venv-electrum" / "bin" / "python"
 ELECTRUM_BIN = RIG_DIR / ".venv-electrum" / "bin" / "electrum"
+# The rig's CLINK service wallet. clink_* commands are wallet-scoped, so the
+# harness pins -w to it; pass wallet=... to target another loaded wallet.
+SERVICE_WALLET = RIG_DIR / ".run" / "electrum" / "regtest" / "wallets" / "clink_test"
 BOOT_TIMEOUT = 300.0
 
 
@@ -43,9 +46,10 @@ def _rig_available() -> bool:
     return RIG_PYTHON.exists() and (RIG_DIR / "run.py").exists()
 
 
-def _electrum_cli(*args: str) -> str:
+def _electrum_cli(*args: str, wallet: Optional[Path] = None) -> str:
     out = subprocess.run(
-        [str(ELECTRUM_BIN), "--regtest", "--dir", str(RIG_DIR / ".run" / "electrum"), *args],
+        [str(ELECTRUM_BIN), "--regtest", "--dir", str(RIG_DIR / ".run" / "electrum"),
+         "-w", str(wallet or SERVICE_WALLET), *args],
         capture_output=True, text=True,
     )
     if out.returncode != 0:
@@ -324,10 +328,7 @@ def test_check_noffers_round_trips_and_leaves_no_trace(rig) -> None:
     status_after = json.loads(_electrum_cli("clink_clink_status"))
     assert status_after["active_reservations"] <= status_before["active_reservations"], status_after
     assert status_after["owed_receipts"] <= status_before["owed_receipts"], status_after
-    # list_requests is wallet-scoped: unlike the clink_* plugin commands it
-    # needs -w (this harness does not pin one the way the rig's helper does).
-    wallet = RIG_DIR / ".run" / "electrum" / "regtest" / "wallets" / "clink_test"
-    requests = json.loads(_electrum_cli("-w", str(wallet), "list_requests"))
+    requests = json.loads(_electrum_cli("list_requests"))
     assert not any("check-e2e" in (r.get("message") or "") for r in requests), \
         "self-test left a payment request behind"
 

@@ -59,7 +59,7 @@ def _listening_server() -> Tuple[ClinkServer, FakeManager]:
     """A real ClinkServer steered into the listening state, network-free."""
     plugin = _plugin()
     plugin.start_plugin(_wallet("/w/a"))
-    server = plugin.server
+    server = plugin.servers()[0]
     assert server is not None
     server.wallet.network = type(  # listener_prerequisites_met needs it
         "N", (), {"is_connected": staticmethod(lambda: True)})()

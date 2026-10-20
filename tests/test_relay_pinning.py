@@ -52,6 +52,8 @@ def _server(offers: Optional[OfferStore] = None) -> Tuple[ClinkServer, List[str]
         CLINK_RELAY="",
         get_nostr_relays=lambda: [FALLBACK, PICKED],
     )
+    from clink.settings import WalletSettings
+    server.settings = WalletSettings({}, server.config)
     server.offers = offers if offers is not None else OfferStore({})
     server.ssl_context = None
     server._proxy_factory = lambda: None
@@ -175,8 +177,10 @@ def _plugin(selection: RelaySelection) -> Tuple[ClinkPlugin, ClinkServer, List[s
         return selection
 
     server.pick_payable_relay = fake_pick  # type: ignore[method-assign]
+    server.wallet = SimpleNamespace(storage=SimpleNamespace(path="/w/pin"))
     plugin = ClinkPlugin.__new__(ClinkPlugin)
-    plugin.server = server
+    plugin._servers = {"/w/pin": server}
+    plugin._taskgroups = {}
     return plugin, server, events
 
 
@@ -184,7 +188,7 @@ def test_create_offer_pins_probed_relay() -> None:
     from clink.noffer import noffer_decode
 
     plugin, server, _events = _plugin(_selection(ok=True))
-    result = _run(plugin.create_offer(label="coffee"))
+    result = _run(plugin.create_offer(server.wallet, label="coffee"))
     offer = server.offers.get(result["offer_id"])
     assert offer is not None
     assert offer.relay == PICKED
@@ -197,7 +201,7 @@ def test_create_offer_pins_probed_relay() -> None:
 def test_create_offer_blocks_when_no_relay_is_payable() -> None:
     plugin, server, _events = _plugin(_selection(ok=False, relay=FALLBACK))
     with pytest.raises(UserFacingException, match="not created"):
-        _run(plugin.create_offer(label="coffee"))
+        _run(plugin.create_offer(server.wallet, label="coffee"))
     assert server.offers.list() == []
 
 
@@ -206,7 +210,7 @@ def test_create_offer_restarts_listener_for_uncovered_relay() -> None:
     # on the picked relay: creating the offer must restart it.
     plugin, server, events = _plugin(_selection(ok=True))
     server.offers.create(relay="wss://elsewhere.example", relay_custom=True)
-    _run(plugin.create_offer(label="coffee"))
+    _run(plugin.create_offer(server.wallet, label="coffee"))
     assert "restart" in events
 
 
@@ -214,10 +218,10 @@ def test_pinned_relay_survives_selection_loss() -> None:
     # The regression this whole change is about: after a restart the in-memory
     # selection is gone and the fallback differs — the noffer must not change.
     plugin, server, _events = _plugin(_selection(ok=True))
-    result = _run(plugin.create_offer(label="coffee"))
+    result = _run(plugin.create_offer(server.wallet, label="coffee"))
     server._relay_selection = None  # simulate wallet reload
     server._relay_selection_at = 0.0
-    listed = plugin.list_offers()[result["offer_id"]]
+    listed = plugin.list_offers(server.wallet)[result["offer_id"]]
     assert listed["relay"] == PICKED
     assert listed["relay_pinned"] is True
     assert listed["relay_custom"] is False

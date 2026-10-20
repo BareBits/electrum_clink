@@ -16,6 +16,14 @@ import clink  # noqa: F401  (import registers the ConfigVars)
 from electrum.simple_config import SimpleConfig
 
 
+def test_wallet_default_enabled_is_off() -> None:
+    """CLINK service is opt-in per wallet: the global default that unset
+    wallets inherit ships as False (the regtest rig flips it to true)."""
+    var = SimpleConfig.CLINK_WALLET_DEFAULT_ENABLED
+    assert var.get_default_value() is False
+    assert var.key() == "plugins.clink.wallet_default_enabled"
+
+
 def test_invoice_expiry_default_is_300s() -> None:
     """The invoice-expiry / liquidity-lock window defaults to 300 seconds."""
     var = SimpleConfig.CLINK_INVOICE_EXPIRY

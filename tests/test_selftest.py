@@ -340,6 +340,8 @@ def _issue_server() -> Tuple[Any, _RecordingWallet, Dict[str, Any]]:
     calls: Dict[str, Any] = {"devfee": [], "receipts": [], "responses": []}
     server.wallet = wallet
     server.config = SimpleNamespace(CLINK_INVOICE_EXPIRY=120)
+    from clink.settings import WalletSettings
+    server.settings = WalletSettings({}, server.config)
     server.recent_activity = deque(maxlen=50)
     server.reserver = LiquidityReserver(capacity_fn=lambda: 1000, clock_fn=time.time)
     server.devfee = SimpleNamespace(mark_issued=lambda rhash: calls["devfee"].append(rhash))
